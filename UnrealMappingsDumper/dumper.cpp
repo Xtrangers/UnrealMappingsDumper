@@ -921,6 +921,13 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 		}
 	}
 
+	// Log de la cle detectee
+	{
+		wchar_t wKey[64] = {};
+		MultiByteToWideChar(CP_UTF8, 0, versionKey.c_str(), -1, wKey, 64);
+		Checkpoint(L"P5b info : versionKey detectee = %s", wKey);
+	}
+
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 	char stamp[32];
@@ -929,22 +936,56 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 
 	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT-EXTRAIT\\SCHEMAS\\versions\\"
 	                       + versionKey + "\\dumps\\umd";
+
 	// std::filesystem cree l'arbo entiere (deja inclus dans framework.h, pas de nouvelle dependance).
+	// create_directories retourne true si nouveau dossier cree, false si deja existant ou echec.
+	// Le vrai indicateur d'echec = fsEc non zero.
 	std::error_code fsEc;
 	std::filesystem::create_directories(schemaBase, fsEc);
+	if (fsEc) {
+		wchar_t wErr[64] = {};
+		wsprintfW(wErr, L"%d", fsEc.value());
+		Checkpoint(L"P5b ERREUR : create_directories a echoue (err=%s) - dump NON copie en SCHEMAS", wErr);
+		return;
+	}
+
+	// Verifie qu'apres l'appel, le dossier existe reellement (double check).
+	if (!std::filesystem::exists(schemaBase, fsEc)) {
+		Checkpoint(L"P5b ERREUR : dossier cible inexistant apres create_directories - dump NON copie");
+		return;
+	}
 
 	std::string schemaFile = schemaBase + "\\Mappings-Aion2-" + stamp + ".usmap";
 
-	auto SchemaOutput = FileWriter(schemaFile.c_str());
-	SchemaOutput.Write<uint16_t>(0x30C4);
-	SchemaOutput.Write<uint8_t>(3);
-	SchemaOutput.Write<uint8_t>(0);
-	SchemaOutput.Write(CompressionMethod);
-	SchemaOutput.Write<uint32_t>(UsmapData.size());
-	SchemaOutput.Write<uint32_t>(uint32_t(UsmapData.size()));
-	SchemaOutput.Write(UsmapData.data(), UsmapData.size());
+	// Ouverture safe : verifie fopen_s AVANT d'utiliser FileWriter (qui fait fclose(nullptr)
+	// dans son dtor si l'ouverture a echoue).
+	FILE* fh = nullptr;
+	if (fopen_s(&fh, schemaFile.c_str(), "wb") != 0 || fh == nullptr) {
+		wchar_t wPath[MAX_PATH * 2] = {};
+		MultiByteToWideChar(CP_UTF8, 0, schemaFile.c_str(), -1, wPath, MAX_PATH * 2);
+		Checkpoint(L"P5b ERREUR : fopen_s a echoue sur %s - dump NON copie", wPath);
+		return;
+	}
+	// Ecrit directement via le FILE* (evite la double ouverture de FileWriter).
+	uint16_t magic  = 0x30C4;
+	uint8_t  ver    = 3;
+	uint8_t  hasVer = 0;
+	uint32_t sz     = static_cast<uint32_t>(UsmapData.size());
+	fwrite(&magic,  sizeof(magic),  1, fh);
+	fwrite(&ver,    sizeof(ver),    1, fh);
+	fwrite(&hasVer, sizeof(hasVer), 1, fh);
+	fwrite(&CompressionMethod, sizeof(CompressionMethod), 1, fh);
+	fwrite(&sz, sizeof(sz), 1, fh);      // compressed
+	fwrite(&sz, sizeof(sz), 1, fh);      // decompressed
+	size_t wrote = fwrite(UsmapData.data(), 1, UsmapData.size(), fh);
+	fflush(fh);
+	fclose(fh);
 
 	wchar_t wSchemaFile[MAX_PATH * 2] = {};
 	MultiByteToWideChar(CP_UTF8, 0, schemaFile.c_str(), -1, wSchemaFile, MAX_PATH * 2);
-	Checkpoint(L"P5b done : usmap AUSSI ECRIT dans %s", wSchemaFile);
+	if (wrote == UsmapData.size()) {
+		Checkpoint(L"P5b done : usmap AUSSI ECRIT dans %s (taille=%zu)", wSchemaFile, wrote);
+	} else {
+		Checkpoint(L"P5b PARTIEL : ecrit %zu/%zu octets dans %s", wrote, UsmapData.size(), wSchemaFile);
+	}
 }
