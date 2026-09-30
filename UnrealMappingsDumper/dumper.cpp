@@ -843,31 +843,83 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	           UsmapData.size(), (size_t)Buffer.Size());
 
 	// --- P5b : copie horodatee dans SCHEMAS\versions\<REGION-Version>\dumps\umd\ ---
-	auto ReadClientVersion = []() -> std::string {
-		HANDLE h = CreateFileW(
-			L"C:\\IA\\Aion\\Aion 2\\Client\\AION2_TW\\VersionInfo_A2_TW_L_GA_PURPLE.xml",
-			GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+	//
+	// Auto-detection region + version selon le processus courant :
+	//   1. Si l'exe se trouve sous "AION2_TW\..." -> region TW, version lue dans
+	//      VersionInfo_A2_TW_L_GA_PURPLE.xml (balise <Version>).
+	//   2. Si l'exe se trouve sous "steamapps\common\AION2\..." -> region EU,
+	//      version = buildid lu dans steamapps\appmanifest_3393110.acf.
+	//   3. Sinon -> "UNKNOWN-_version-inconnue".
+	auto ReadFileAll = [](const wchar_t* path, char* out, DWORD outSize) -> DWORD {
+		HANDLE h = CreateFileW(path, GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
 			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-		if (h == INVALID_HANDLE_VALUE) return "TW-_version-inconnue";
-		char buf[2048] = {};
+		if (h == INVALID_HANDLE_VALUE) return 0;
 		DWORD read = 0;
-		ReadFile(h, buf, sizeof(buf) - 1, &read, nullptr);
+		ReadFile(h, out, outSize - 1, &read, nullptr);
 		CloseHandle(h);
-		const char* open = strstr(buf, "<Version>");
-		if (!open) return "TW-_version-inconnue";
-		open += 9;
-		const char* close = strstr(open, "</Version>");
-		if (!close || close <= open || (close - open) > 16) return "TW-_version-inconnue";
-		std::string ver(open, close - open);
-		while (!ver.empty() && (ver.back() == ' ' || ver.back() == '\r' || ver.back() == '\n' || ver.back() == '\t'))
-			ver.pop_back();
-		while (!ver.empty() && (ver.front() == ' ' || ver.front() == '\r' || ver.front() == '\n' || ver.front() == '\t'))
-			ver.erase(0, 1);
-		if (ver.empty()) return "TW-_version-inconnue";
-		return "TW-" + ver;
+		if (read < outSize) out[read] = 0;
+		return read;
+	};
+	auto TrimVerAscii = [](std::string& v) {
+		while (!v.empty() && (v.back() == ' ' || v.back() == '\r' || v.back() == '\n' || v.back() == '\t' || v.back() == '"'))
+			v.pop_back();
+		while (!v.empty() && (v.front() == ' ' || v.front() == '\r' || v.front() == '\n' || v.front() == '\t' || v.front() == '"'))
+			v.erase(0, 1);
 	};
 
-	std::string versionKey = ReadClientVersion();
+	// Recupere le chemin de l'exe courant
+	wchar_t exePath[MAX_PATH * 2] = {};
+	GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
+
+	std::string versionKey = "UNKNOWN-_version-inconnue";
+
+	// --- Piste TW : chemin contient "AION2_TW" ---
+	if (wcsstr(exePath, L"AION2_TW") != nullptr) {
+		char buf[2048] = {};
+		DWORD n = ReadFileAll(
+			L"C:\\IA\\Aion\\Aion 2\\Client\\AION2_TW\\VersionInfo_A2_TW_L_GA_PURPLE.xml",
+			buf, sizeof(buf));
+		versionKey = "TW-_version-inconnue";
+		if (n > 0) {
+			const char* op = strstr(buf, "<Version>");
+			if (op) {
+				op += 9;
+				const char* cl = strstr(op, "</Version>");
+				if (cl && cl > op && (cl - op) <= 16) {
+					std::string ver(op, cl - op);
+					TrimVerAscii(ver);
+					if (!ver.empty()) versionKey = "TW-" + ver;
+				}
+			}
+		}
+	}
+	// --- Piste EU : chemin contient "steamapps\common\AION2" ---
+	else if (wcsstr(exePath, L"steamapps") != nullptr) {
+		char buf[4096] = {};
+		DWORD n = ReadFileAll(
+			L"C:\\Program Files (x86)\\Steam\\steamapps\\appmanifest_3393110.acf",
+			buf, sizeof(buf));
+		versionKey = "EU-_version-inconnue";
+		if (n > 0) {
+			const char* op = strstr(buf, "\"buildid\"");
+			if (op) {
+				op = strchr(op + 9, '"');   // apres "buildid"
+				if (op) {
+					op = strchr(op + 1, '"'); // ouvre "
+					if (op) {
+						op++;
+						const char* cl = strchr(op, '"');
+						if (cl && cl > op && (cl - op) <= 16) {
+							std::string ver(op, cl - op);
+							TrimVerAscii(ver);
+							if (!ver.empty()) versionKey = "EU-" + ver;
+						}
+					}
+				}
+			}
+		}
+	}
 
 	SYSTEMTIME st;
 	GetLocalTime(&st);
