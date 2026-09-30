@@ -934,6 +934,38 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	wsprintfA(stamp, "%04d-%02d-%02d-%02dh%02d",
 	          st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
 
+	// Tag optionnel : Remi ecrit un nom court dans C:\Users\Public\umd-tag.txt
+	// avant l'injection (ex: "lvl05-menu", "lvl20-donjon"). Le nom devient
+	// Mappings-Aion2-<tag>-<timestamp>.usmap. Si absent ou vide -> pas de tag.
+	std::string tag;
+	{
+		char tagBuf[128] = {};
+		DWORD n = ReadFileAll(L"C:\\Users\\Public\\umd-tag.txt", tagBuf, sizeof(tagBuf));
+		if (n > 0) {
+			tag.assign(tagBuf, tagBuf + strnlen(tagBuf, sizeof(tagBuf)));
+			TrimVerAscii(tag);
+			// Nettoie les caracteres interdits dans un nom de fichier Windows
+			// (<>:"/\|?* + espaces au milieu) -> remplace par '-'.
+			for (size_t i = 0; i < tag.size(); i++) {
+				char c = tag[i];
+				if (c == '<' || c == '>' || c == ':' || c == '"' || c == '/' ||
+				    c == '\\' || c == '|' || c == '?' || c == '*' || c == ' ' ||
+				    (unsigned char)c < 32) {
+					tag[i] = '-';
+				}
+			}
+			// Cap la longueur pour eviter les chemins trop longs
+			if (tag.size() > 48) tag.resize(48);
+		}
+		wchar_t wTag[128] = {};
+		if (!tag.empty()) {
+			MultiByteToWideChar(CP_UTF8, 0, tag.c_str(), -1, wTag, 128);
+			Checkpoint(L"P5b info : tag lu = %s", wTag);
+		} else {
+			Checkpoint(L"P5b info : pas de tag (umd-tag.txt absent ou vide)");
+		}
+	}
+
 	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT-EXTRAIT\\SCHEMAS\\versions\\"
 	                       + versionKey + "\\dumps\\umd";
 
@@ -955,7 +987,10 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 		return;
 	}
 
-	std::string schemaFile = schemaBase + "\\Mappings-Aion2-" + stamp + ".usmap";
+	// Construit le nom final : Mappings-Aion2[-<tag>]-<timestamp>.usmap
+	std::string schemaFile = schemaBase + "\\Mappings-Aion2";
+	if (!tag.empty()) schemaFile += "-" + tag;
+	schemaFile += "-" + std::string(stamp) + ".usmap";
 
 	// Ouverture safe : verifie fopen_s AVANT d'utiliser FileWriter (qui fait fclose(nullptr)
 	// dans son dtor si l'ouverture a echoue).
