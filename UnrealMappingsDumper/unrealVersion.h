@@ -347,7 +347,12 @@ public:
 
 struct UnrealVersionBase : IUnrealVersion
 {
-	static constexpr int FPropertySize = 0x78;
+	// Aion 2 EU (30/09/2026, buildid 25624879) : FProperty fait 0x80 bytes
+	// (verifie via diff d'adresses successives dans umd-struct-layout.log :
+	//  RigVMFunction Value->Count = 0x80, InputSettings AxisConfig->PlatformSettings = 0x80,
+	//  AionWidget P_Txt_Title->P_RTxt_Guide = 0x80).
+	// Vanilla UE 5.3 : 0x78.
+	static constexpr int FPropertySize = 0x80;
 	static constexpr bool HasOptimizedFName = false;
 
 	struct Offsets
