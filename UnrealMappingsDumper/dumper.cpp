@@ -4,6 +4,247 @@
 #include "writer.h"
 #include "oodle.h"
 
+// v0.0.17.12 : validation runtime pointeur via VirtualQuery — evite les crashes
+// silencieux sur UStruct partiels (heap corruption bypass SEH).
+// v0.0.17.17 : revert alignment check de 17.16 qui a regresse le ForEach.
+// Le baseline 17.15 marchait jusqu'a P3 iter=0, on garde cette version.
+static bool IsPtrReadable(const void* p) noexcept
+{
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    DWORD prot = mbi.Protect & 0xFF;
+    if (prot == 0 || prot == PAGE_NOACCESS) return false;
+    if (mbi.Protect & PAGE_GUARD) return false;
+    return true;
+}
+
+// Traite un UStruct avec __try/__except au niveau de la fonction dediee
+// (SEH ne fonctionne pas toujours proprement dans une lambda C++). Retourne
+// false si un crash a ete rattrape.
+template<class NameMapT>
+static bool TryProcessStruct(UStruct* Struct,
+                              std::vector<UStruct*>& Structs,
+                              NameMapT& NameMap) noexcept
+{
+    if (!IsPtrReadable(Struct)) return false;
+
+    __try
+    {
+        Structs.push_back(Struct);
+
+        NameMap.insert_or_assign(Struct->GetFName(), 0);
+
+        UStruct* Super = Struct->Super();
+        if (IsPtrReadable(Super) && !NameMap.contains(Super->GetFName()))
+            NameMap.insert_or_assign(Super->GetFName(), 0);
+
+        FProperty* Props = Struct->ChildProperties();
+        int guardMax = 4096;  // fusible : rare struct avec > 4096 fields
+        while (IsPtrReadable(Props) && guardMax-- > 0)
+        {
+            NameMap.insert_or_assign(Props->GetFName(), 0);
+            Props = static_cast<FProperty*>(Props->GetNext());
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// v0.0.17.16 : TrySerializeOneStruct — meme pattern que TryProcessStruct mais
+// pour la boucle serialisation. Evite std::vector<FPropertyData> local (C2712)
+// en faisant 2 passes sur ChildProperties : (1) count PropCount/Serializable,
+// (2) serialize. Ainsi __try/__except propre.
+static EPropertyType GetPropertyType(FProperty* Prop);  // forward decl
+
+template<class NameMapT, class WritePropFn>
+static bool TrySerializeOneStruct(UStruct* Struct, StreamWriter& Buffer,
+    NameMapT& NameMap, WritePropFn& WriteProperty) noexcept
+{
+    if (!IsPtrReadable(Struct)) return false;
+    __try
+    {
+        Buffer.Write(NameMap[Struct->GetFName()]);
+
+        UStruct* Super = Struct->Super();
+        Buffer.Write<int32_t>(IsPtrReadable(Super) ? NameMap[Super->GetFName()] : int32_t(0xffffffff));
+
+        // Pass 1 : count PropCount + SerializablePropCount
+        FProperty* first = Struct->ChildProperties();
+        FProperty* Props = first;
+        uint16_t PropCount = 0;
+        uint16_t SerializablePropCount = 0;
+        int guardMax = 4096;
+        while (IsPtrReadable(Props) && guardMax-- > 0)
+        {
+            uint16_t dim = uint16_t(Props->GetArrayDim());
+            PropCount += dim;
+            SerializablePropCount++;
+            Props = static_cast<FProperty*>(Props->GetNext());
+        }
+
+        Buffer.Write(PropCount);
+        Buffer.Write(SerializablePropCount);
+
+        // Pass 2 : serialize
+        Props = first;
+        uint16_t indexAcc = 0;
+        int guardMax2 = 4096;
+        while (IsPtrReadable(Props) && guardMax2-- > 0)
+        {
+            uint16_t dim = uint16_t(Props->GetArrayDim());
+            Buffer.Write<uint16_t>(indexAcc);
+            Buffer.Write<uint8_t>(uint8_t(dim));    // v0.0.19.4 post-maj : u8 pas u16 (CUE4Parse attend byte)
+            Buffer.Write(NameMap[Props->GetFName()]);
+            EPropertyType t = GetPropertyType(Props);
+            WriteProperty(Props, t);
+            indexAcc += dim;
+            Props = static_cast<FProperty*>(Props->GetNext());
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+template<class NameMapT>
+static bool TryProcessEnum(UEnum* Enum,
+                            std::vector<UEnum*>& Enums,
+                            NameMapT& NameMap) noexcept
+{
+    if (!IsPtrReadable(Enum)) return false;
+
+    __try
+    {
+        Enums.push_back(Enum);
+        NameMap.insert_or_assign(Enum->GetFName(), 0);
+
+        auto& EnumNames = Enum->Names();
+        int n = EnumNames.Num();
+        if (n < 0 || n > 100000) return true;  // fusible : garde le push_back mais skip noms
+        for (int i = 0; i < n; i++)
+            NameMap.insert_or_assign(EnumNames[i].Key.GetNumber(), 0);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// v0.0.17.20 : versions "Enrich only" appelees HORS du ForEach. Le ForEach
+// se contente d'un push_back + NameMap[fname]=0 (2 ops, comme 17.12 qui
+// passait). L'enrichissement Super + Props (lourd, ~20 VirtualQuery par
+// struct) est fait dans une phase P0 dediee AVEC checkpoints toutes les 500
+// iter pour pouvoir tracer un crash precisement.
+template<class NameMapT>
+static bool TryEnrichStructNameMap(UStruct* Struct, NameMapT& NameMap) noexcept
+{
+    if (!IsPtrReadable(Struct)) return false;
+    __try
+    {
+        UStruct* Super = Struct->Super();
+        if (IsPtrReadable(Super) && !NameMap.contains(Super->GetFName()))
+            NameMap.insert_or_assign(Super->GetFName(), 0);
+        FProperty* Props = Struct->ChildProperties();
+        int guardMax = 4096;
+        while (IsPtrReadable(Props) && guardMax-- > 0)
+        {
+            NameMap.insert_or_assign(Props->GetFName(), 0);
+            Props = static_cast<FProperty*>(Props->GetNext());
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+template<class NameMapT>
+static bool TryEnrichEnumNameMap(UEnum* Enum, NameMapT& NameMap) noexcept
+{
+    if (!IsPtrReadable(Enum)) return false;
+    __try
+    {
+        auto& EnumNames = Enum->Names();
+        int n = EnumNames.Num();
+        if (n < 0 || n > 100000) return true;
+        for (int i = 0; i < n; i++)
+            NameMap.insert_or_assign(EnumNames[i].Key.GetNumber(), 0);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// v0.0.17.27 : Scan FNamePool brut. Extrait en fonction free noexcept car
+// Dumper::Run contient std::string/vector/unordered_map -> C2712 sur __try.
+// Retourne stats via param out.
+template<class NameMapT>
+static void ScanFNamePoolBrut(NameMapT& NameMap,
+                               int& outBlocks, int& outNames, int& outSkip) noexcept
+{
+    outBlocks = 0; outNames = 0; outSkip = 0;
+    HMODULE hAion = GetModuleHandleW(L"Aion2.exe");
+    if (!hAion) return;
+
+    uint8_t* pool = (uint8_t*)hAion + 0x0F0791C0;   // v0.0.19.4 : post-maj 09/09/2026 (ancien 0x0EE7AFC0)
+    uint32_t currentBlock = *(uint32_t*)(pool + 0x08);
+    uint32_t currentByteCursor = *(uint32_t*)(pool + 0x0C);
+    uint8_t** blocks = (uint8_t**)(pool + 0x10);
+
+    for (uint32_t blockIdx = 0; blockIdx <= currentBlock && blockIdx < 8192; blockIdx++) {
+        uint8_t* blockPtr = blocks[blockIdx];
+        if (!IsPtrReadable(blockPtr)) continue;
+        outBlocks++;
+
+        uint32_t blockEnd = (blockIdx == currentBlock) ? currentByteCursor : 0x10000;
+        if (blockEnd > 0x10000) blockEnd = 0x10000;
+        uint32_t offset = 0;
+
+        while (offset + 2 < blockEnd) {
+            uint32_t nextOffset = offset + 2;
+            __try {
+                uint16_t hdr = *(uint16_t*)(blockPtr + offset);
+                if (hdr == 0) { nextOffset = blockEnd; }
+                else {
+                    bool isWide = (hdr & 1) != 0;
+                    uint16_t len = (hdr >> 6) & 0x3FF;
+                    if (len == 0 || len > 200) {
+                        nextOffset = offset + 2;
+                    } else {
+                        bool valid = true;
+                        if (!isWide) {
+                            const char* src = (const char*)(blockPtr + offset + 2);
+                            for (uint16_t i = 0; i < len; i++) {
+                                unsigned char c = (unsigned char)src[i];
+                                if (c < 0x20 || c > 0x7E) { valid = false; break; }
+                            }
+                        }
+                        if (valid) {
+                            uint32_t fnameId = (blockIdx << 16) | (offset / 2);
+                            NameMap.insert_or_assign(FName((int)fnameId), 0);
+                            outNames++;
+                        } else {
+                            outSkip++;
+                        }
+                        uint32_t entrySize = 2 + (isWide ? uint32_t(len) * 2 : uint32_t(len));
+                        if (entrySize & 1) entrySize++;
+                        nextOffset = offset + entrySize;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                nextOffset = offset + 2;
+            }
+            if (nextOffset <= offset) break;
+            offset = nextOffset;
+        }
+    }
+}
+
 static EPropertyType GetPropertyType(FProperty* Prop)
 {
 	switch (Prop->GetClass()->GetId())
@@ -219,50 +460,259 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 
 	WritePropertyWrapper = WriteProperty;
 
+	// v0.0.17.7 AION 2 : resolveur dynamique final. Dump 17.6 a revele :
+	//   - GetName() du Package = "/Script/CoreUObject" (path complet)
+	//   - "Class" a idx=10, "ScriptStruct" a idx=8, "Enum" a idx=16 (dans les 30
+	//     premiers, safe pour Class() deref)
+	// Strategie :
+	//   1) Scanner les 50 premiers (safe zone verifiee via 17.6 dump).
+	//   2) Pas de filtre Outer (les 3 noms sont uniques dans cette zone).
+	//   3) Utiliser obj->Class() -> pointeur meta-type stable.
+	//   4) Reactiver le ForEach compare-by-pointer (validee safe par 17.3 sur 386k).
+	UObject* pUClass  = nullptr;
+	UObject* pUStruct = nullptr;
+	UObject* pUEnum   = nullptr;
+	int pUClassIdx = -1, pUStructIdx = -1, pUEnumIdx = -1;
+
+	int scanMax = 50;
+	if (ObjObjects::Num() < scanMax) scanMax = ObjObjects::Num();
+
+	for (int i = 0; i < scanMax; i++)
+	{
+		UObject* obj = ObjObjects::GetObjectByIndex(i);
+		if (!obj) continue;
+
+		auto n = obj->GetName();
+		if (n.empty()) continue;
+
+		// v0.0.17.8 : prendre obj (pas obj->Class()) : le UObject nomme "Class" EST
+		// le meta-type UClass. Object->Class() de tout Object UClass retourne cet
+		// UObject "Class". Idem pour ScriptStruct et Enum. Evite l'appel Class()
+		// sur les 3 meta-types dans le scan (source du crash 17.7).
+		if (!pUClass  && n == std::wstring_view(L"Class"))        { pUClass  = obj; pUClassIdx  = i; }
+		if (!pUStruct && n == std::wstring_view(L"ScriptStruct")) { pUStruct = obj; pUStructIdx = i; }
+		if (!pUEnum   && n == std::wstring_view(L"Enum"))         { pUEnum   = obj; pUEnumIdx   = i; }
+
+		if (pUClass && pUStruct && pUEnum) break;
+	}
+
+	// v0.0.17.10 : ECRIRE fichier debug AVANT le ForEach avec stats resolveur seul.
+	// Comme ca, meme si ForEach crash, on saura si le resolveur a marche.
+	{
+		HANDLE h = CreateFileW(L"C:\\Users\\Public\\umd-foreach-debug.log",
+			GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+			CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h != INVALID_HANDLE_VALUE) {
+			wchar_t bom = 0xFEFF; DWORD w = 0;
+			WriteFile(h, &bom, sizeof(bom), &w, nullptr);
+			wchar_t line[1024];
+			int len = swprintf(line, 1024,
+				L"v0.0.17.10 : resolveur (scan %d) — ECRIT AVANT ForEach\r\n"
+				L"  Num()      = %d\r\n"
+				L"  pUClass    = 0x%llX (idx=%d)\r\n"
+				L"  pUStruct   = 0x%llX (idx=%d)\r\n"
+				L"  pUEnum     = 0x%llX (idx=%d)\r\n"
+				L"\r\n[Attente ForEach...]\r\n",
+				scanMax, ObjObjects::Num(),
+				(unsigned long long)pUClass, pUClassIdx,
+				(unsigned long long)pUStruct, pUStructIdx,
+				(unsigned long long)pUEnum, pUEnumIdx);
+			WriteFile(h, line, len * sizeof(wchar_t), &w, nullptr);
+			FlushFileBuffers(h);
+			CloseHandle(h);
+		}
+	}
+
+	// v0.0.17.27 : Phase P-1 SCAN FNAMEPOOL BRUT (via fonction free noexcept)
+	{
+		int p1TotalBlocks = 0, p1TotalNames = 0, p1SkipInvalid = 0;
+		ScanFNamePoolBrut(NameMap, p1TotalBlocks, p1TotalNames, p1SkipInvalid);
+
+		HANDLE h = CreateFileW(L"C:\\Users\\Public\\umd-namepool-scan.log",
+			GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+			CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h != INVALID_HANDLE_VALUE) {
+			wchar_t bom = 0xFEFF; DWORD w = 0;
+			WriteFile(h, &bom, sizeof(bom), &w, nullptr);
+			wchar_t line[512];
+			int n = swprintf(line, 512,
+				L"v0.0.17.27 : P-1 scan FNamePool brut\r\n"
+				L"  Blocks scanned       = %d\r\n"
+				L"  Names ajoutes        = %d\r\n"
+				L"  Skip invalid charset = %d\r\n"
+				L"  NameMap.size apres   = %zu\r\n",
+				p1TotalBlocks, p1TotalNames, p1SkipInvalid, NameMap.size());
+			WriteFile(h, line, n * sizeof(wchar_t), &w, nullptr);
+			FlushFileBuffers(h);
+			CloseHandle(h);
+		}
+	}
+
+	int g_ForEachIter = 0;
+	int g_ForEachNullObj = 0;
+	int g_ForEachClassMatch = 0;
+	int g_ForEachEnumMatch = 0;
+	int g_ForEachSkipped = 0;
+
+	// v0.0.17.12 : ForEach avec TryProcessStruct/TryProcessEnum fonctions dediees
+	// qui portent le SEH __try/__except (plus fiable que lambda) + validation
+	// VirtualQuery de chaque pointeur avant deref.
+	int g_ForEachRejectStruct = 0;
+	int g_ForEachRejectEnum   = 0;
+
+	// v0.0.17.20 : ForEach STRICT 17.12 — push_back + NameMap[fname]=0 UNIQUEMENT
+	// dans le hot path (2 ops par match). L'enrichissement Super+Props est
+	// deporte dans une phase P0 dediee avec checkpoints (voir plus bas). But :
+	// tenir sous ~5s dans le ForEach (validee 17.12 sur 386k iter).
 	ObjObjects::ForEach([&](UObject*& Object)
 		{
-			if (Object->Class() == UClass::StaticClass() ||
-			Object->Class() == UScriptStruct::StaticClass())
+			g_ForEachIter++;
+			if (!Object) { g_ForEachNullObj++; return; }
+			if (!IsPtrReadable(Object)) { g_ForEachSkipped++; return; }
+
+			UObject* cls = nullptr;
+			__try {
+				cls = Object->Class();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				g_ForEachSkipped++;
+				return;
+			}
+			if (!IsPtrReadable(cls)) return;
+
+			// v0.0.17.26 : capture GREEDY tous les FName + Outer chain (max 10)
+			// pour approcher les 74k noms du usmap reference. Sans ca on reste a
+			// ~24k (juste les 14337 Structs+Enums matched).
+			__try {
+				NameMap.insert_or_assign(Object->GetFName(), 0);
+				UObject* o = Object;
+				for (int d = 0; d < 10; d++) {
+					UObject* outer = o->Outer();
+					if (!IsPtrReadable(outer) || outer == o) break;
+					NameMap.insert_or_assign(outer->GetFName(), 0);
+					o = outer;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (cls == pUClass || cls == pUStruct)
 			{
-				auto Struct = static_cast<UStruct*>(Object);
-
-				Structs.push_back(Struct);
-
-				NameMap.insert_or_assign(Struct->GetFName(), 0);
-
-				if (Struct->Super() && !NameMap.contains(Struct->Super()->GetFName()))
-					NameMap.insert_or_assign(Struct->Super()->GetFName(), 0);
-
-				auto Props = Struct->ChildProperties();
-
-				while (Props)
-				{
-					NameMap.insert_or_assign(Props->GetFName(), 0);
-					Props = static_cast<FProperty*>(Props->GetNext());
+				g_ForEachClassMatch++;
+				__try {
+					Structs.push_back(static_cast<UStruct*>(Object));
+					NameMap.insert_or_assign(Object->GetFName(), 0);
+				} __except (EXCEPTION_EXECUTE_HANDLER) {
+					g_ForEachRejectStruct++;
 				}
 			}
-			else if (Object->Class() == UEnum::StaticClass())
+			else if (cls == pUEnum)
 			{
-				auto Enum = static_cast<UEnum*>(Object);
-				Enums.push_back(Enum);
-
-				NameMap.insert_or_assign(Enum->GetFName(), 0);
-
-				auto& EnumNames = Enum->Names();
-
-				for (auto i = 0; i < EnumNames.Num(); i++)
-				{
-					NameMap.insert_or_assign(EnumNames[i].Key.GetNumber(), 0);
+				g_ForEachEnumMatch++;
+				__try {
+					Enums.push_back(static_cast<UEnum*>(Object));
+					NameMap.insert_or_assign(Object->GetFName(), 0);
+				} __except (EXCEPTION_EXECUTE_HANDLER) {
+					g_ForEachRejectEnum++;
 				}
 			}
 		});
 
+	// Ecrit stats ForEach dans un 2eme fichier.
+	{
+		HANDLE h = CreateFileW(L"C:\\Users\\Public\\umd-foreach-after.log",
+			GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+			CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h != INVALID_HANDLE_VALUE) {
+			wchar_t bom = 0xFEFF; DWORD w = 0;
+			WriteFile(h, &bom, sizeof(bom), &w, nullptr);
+			wchar_t line[1024];
+			int len = swprintf(line, 1024,
+				L"v0.0.17.12 : ForEach + TryProcess dediees + VirtualQuery gate\r\n"
+				L"  Iter                 = %d\r\n"
+				L"  NullObjects          = %d\r\n"
+				L"  Skipped (bad ptr)    = %d\r\n"
+				L"  UClass+Struct match  = %d\r\n"
+				L"  UEnum match          = %d\r\n"
+				L"  Struct rejects (SEH) = %d\r\n"
+				L"  Enum rejects (SEH)   = %d\r\n"
+				L"  Structs.size()       = %zu\r\n"
+				L"  Enums.size()         = %zu\r\n"
+				L"  NameMap.size()       = %zu\r\n",
+				g_ForEachIter, g_ForEachNullObj, g_ForEachSkipped,
+				g_ForEachClassMatch, g_ForEachEnumMatch,
+				g_ForEachRejectStruct, g_ForEachRejectEnum,
+				Structs.size(), Enums.size(), NameMap.size());
+			WriteFile(h, line, len * sizeof(wchar_t), &w, nullptr);
+			FlushFileBuffers(h);
+			CloseHandle(h);
+		}
+	}
+
+	// v0.0.17.15 : CHECKPOINT tracing pour identifier ou crash arrive.
+	// Chaque phase incremente un checkpoint file avec flush.
+	auto Checkpoint = [](const wchar_t* fmt, ...) noexcept {
+		HANDLE h = CreateFileW(L"C:\\Users\\Public\\umd-checkpoint.log",
+			FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+			OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h == INVALID_HANDLE_VALUE) return;
+		LARGE_INTEGER sz{}; GetFileSizeEx(h, &sz);
+		if (sz.QuadPart == 0) {
+			wchar_t bom = 0xFEFF; DWORD w=0;
+			WriteFile(h, &bom, sizeof(bom), &w, nullptr);
+		}
+		wchar_t line[512];
+		va_list ap; va_start(ap, fmt);
+		int n = vswprintf(line, 512, fmt, ap);
+		va_end(ap);
+		if (n < 0) n = 0;
+		DWORD w=0;
+		WriteFile(h, line, n * sizeof(wchar_t), &w, nullptr);
+		WriteFile(h, L"\r\n", 4, &w, nullptr);
+		FlushFileBuffers(h);
+		CloseHandle(h);
+	};
+
+	// v0.0.17.20 : Phase P0 Enrichment — populate NameMap avec Super+Props (Structs)
+	// et EnumNames (Enums), boucles SEPAREES du ForEach avec checkpoints toutes les
+	// 500 iter. Si le watchdog Aion 2 tue le thread ici, on aura l'index exact.
+	{
+		Checkpoint(L"P0 Enrich Structs start : Structs.size=%zu", Structs.size());
+		int p0StructSkipped = 0;
+		int p0StructIter = 0;
+		for (auto* S : Structs)
+		{
+			if (p0StructIter > 0 && (p0StructIter % 500) == 0)
+				Checkpoint(L"P0 Enrich Structs iter=%d/%zu (skipped=%d)",
+					p0StructIter, Structs.size(), p0StructSkipped);
+			if (!TryEnrichStructNameMap(S, NameMap)) p0StructSkipped++;
+			p0StructIter++;
+		}
+		Checkpoint(L"P0 Enrich Structs done : iter=%d skipped=%d NameMap.size=%zu",
+			p0StructIter, p0StructSkipped, NameMap.size());
+
+		Checkpoint(L"P0 Enrich Enums start : Enums.size=%zu", Enums.size());
+		int p0EnumSkipped = 0;
+		int p0EnumIter = 0;
+		for (auto* E : Enums)
+		{
+			if (p0EnumIter > 0 && (p0EnumIter % 500) == 0)
+				Checkpoint(L"P0 Enrich Enums iter=%d/%zu (skipped=%d)",
+					p0EnumIter, Enums.size(), p0EnumSkipped);
+			if (!TryEnrichEnumNameMap(E, NameMap)) p0EnumSkipped++;
+			p0EnumIter++;
+		}
+		Checkpoint(L"P0 Enrich Enums done : iter=%d skipped=%d NameMap.size=%zu",
+			p0EnumIter, p0EnumSkipped, NameMap.size());
+	}
+
+	Checkpoint(L"P1 start : NameMap.size=%zu", NameMap.size());
 	Buffer.Write<int>(NameMap.size());
 
 	int CurrentNameIndex = 0;
 
 	for (auto&& N : NameMap)
 	{
+		if ((CurrentNameIndex % 2000) == 0)
+			Checkpoint(L"P1 NameMap iter=%d/%zu", CurrentNameIndex, NameMap.size());
+
 		NameMap[N.first] = CurrentNameIndex;
 
 		auto Name = N.first.ToString();
@@ -274,64 +724,77 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			NameView = NameView.substr(Find + 2);
 		}
 
-		Buffer.Write<uint8_t>(NameView.length());
+		// v0.0.17.24 : u16 length (format usmap v3+) — u8 truncatait les names
+		// > 255 chars et desalignait tous les names suivants. Compat CUE4Parse/FModel.
+		Buffer.Write<uint16_t>(uint16_t(NameView.length()));
 		Buffer.WriteString(NameView);
 
 		CurrentNameIndex++;
 	}
+	Checkpoint(L"P1 done : %d names ecrits", CurrentNameIndex);
 
+	Checkpoint(L"P2 start : Enums.size=%zu", Enums.size());
 	Buffer.Write<uint32_t>(Enums.size());
 
+	int enumIdx = 0;
 	for (auto Enum : Enums)
 	{
+		if ((enumIdx % 500) == 0)
+			Checkpoint(L"P2 Enums iter=%d/%zu", enumIdx, Enums.size());
+		enumIdx++;
+
+		if (!IsPtrReadable(Enum)) {
+			Buffer.Write<uint32_t>(0);   // name index dummy
+			Buffer.Write<uint8_t>(0);    // 0 enum entries
+			continue;
+		}
 		Buffer.Write(NameMap[Enum->GetFName()]);
 
 		auto& EnumNames = Enum->Names();
-		Buffer.Write<uint8_t>(EnumNames.Num());
+		int nEnums = EnumNames.Num();
+		if (nEnums < 0 || nEnums > 255) nEnums = 0;
+		Buffer.Write<uint8_t>(uint8_t(nEnums));
 
-		for (size_t i = 0; i < EnumNames.Num(); i++)
+		for (int i = 0; i < nEnums; i++)
 		{
 			Buffer.Write<int>(NameMap[EnumNames[i].Key]);
 		}
 	}
+	Checkpoint(L"P2 done");
 
+	// v0.0.17.13 : boucle Structs de serialisation avec VirtualQuery gate.
+	Checkpoint(L"P3 start : Structs.size=%zu", Structs.size());
 	Buffer.Write<uint32_t>(Structs.size());
 
+	// v0.0.17.16 : fonction dediee TrySerializeOneStruct avec __try/__except.
+	// La lambda contient un std::vector local (C2712 empeche __try dedans), donc
+	// on delegue a une fonction free qui gere tout via SEH.
+	int structIdx = 0;
+	int structSkipped = 0;
 	for (auto Struct : Structs)
 	{
-		Buffer.Write(NameMap[Struct->GetFName()]);
-		Buffer.Write<int32_t>(Struct->Super() ? NameMap[Struct->Super()->GetFName()] : 0xffffffff);
+		if ((structIdx % 100) == 0)
+			Checkpoint(L"P3 Structs iter=%d/%zu (skipped=%d)", structIdx, Structs.size(), structSkipped);
+		structIdx++;
 
-		std::vector<FPropertyData> Properties;
-
-		auto Props = Struct->ChildProperties();
-		uint16_t PropCount = 0;
-		uint16_t SerializablePropCount = 0;
-
-		while (Props)
-		{
-			FPropertyData Data(Props, PropCount);
-
-			Properties.push_back(Data);
-			Props = static_cast<FProperty*>(Props->GetNext());
-
-			PropCount += Data.ArrayDim;
-			SerializablePropCount++;
-		}
-
-		Buffer.Write(PropCount);
-		Buffer.Write(SerializablePropCount);
-
-		for (auto P : Properties)
-		{
-			Buffer.Write<uint16_t>(P.Index);
-			Buffer.Write(P.ArrayDim);
-			Buffer.Write(NameMap[P.Name]);
-
-			WriteProperty(P.Prop, P.PropertyType);
+		// v0.0.17.28 : Sauver position AVANT TrySerializeOneStruct. Si crash au
+		// milieu, on rewind et ecrit un placeholder valide 12 bytes -> les prochaines
+		// writes overwritent le garbage. Sans ca le parser lit un struct avec
+		// nameIdx/serPropCount corrompu -> desync.
+		uint32_t posBefore = uint32_t(Buffer.GetBuffer().tellp());
+		bool ok = TrySerializeOneStruct(Struct, Buffer, NameMap, WriteProperty);
+		if (!ok) {
+			structSkipped++;
+			Buffer.GetBuffer().seekp(posBefore);  // rewind
+			Buffer.Write<uint32_t>(0);
+			Buffer.Write<int32_t>(int32_t(0xffffffff));
+			Buffer.Write<uint16_t>(0);
+			Buffer.Write<uint16_t>(0);
 		}
 	}
+	Checkpoint(L"P3 done : %d skipped", structSkipped);
 
+	Checkpoint(L"P4 start compression");
 	std::vector<uint8_t> UsmapData;
 
 	switch (CompressionMethod)
@@ -343,19 +806,93 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	}
 	default:
 	{
-		std::string UncompressedStream = Buffer.GetBuffer().str();
-		UsmapData.resize(UncompressedStream.size());
-		memcpy(UsmapData.data(), UncompressedStream.data(), UsmapData.size());
+		// v0.0.17.28 : truncate a tellp() reel pour eviter les garbage residuels
+		// laisses au-dela du put pointer par les rewinds P3.
+		auto& ss = Buffer.GetBuffer();
+		size_t realSize = size_t(ss.tellp());
+		std::string UncompressedStream = ss.str();
+		if (realSize > UncompressedStream.size()) realSize = UncompressedStream.size();
+		UsmapData.resize(realSize);
+		if (realSize > 0)
+			memcpy(UsmapData.data(), UncompressedStream.data(), realSize);
 	}
 	}
+	Checkpoint(L"P4 done : UsmapData.size=%zu", UsmapData.size());
 
-	auto FileOutput = FileWriter("Mappings.usmap");
+	// v0.0.17.25 (30/09/2026) : ecrit dans DEUX endroits.
+	//   1. C:\Users\Public\Mappings-Aion2.usmap  (compat + fallback historique)
+	//   2. CLIENT-EXTRAIT\SCHEMAS\versions\<REGION-Version>\dumps\umd\Mappings-Aion2-<ts>.usmap
+	//      (rangement par version du client Aion 2, cf. reorg 30/09/2026)
+	//
+	// Lit la version dynamiquement dans :
+	//   C:\IA\Aion\Aion 2\Client\AION2_TW\VersionInfo_A2_TW_L_GA_PURPLE.xml (balise <Version>)
+	//   -> cle "TW-<version>", fallback "TW-_version-inconnue" sinon.
+	Checkpoint(L"P5 start WriteFile usmap");
+	auto FileOutput = FileWriter("C:\\Users\\Public\\Mappings-Aion2.usmap");
 
-	FileOutput.Write<uint16_t>(0x30C4); //magic
-	FileOutput.Write<uint8_t>(0); //version
-	FileOutput.Write(CompressionMethod); //compression
-	FileOutput.Write<uint32_t>(UsmapData.size()); //compressed size
-	FileOutput.Write<uint32_t>(Buffer.Size()); //decompressed size
+	// v0.0.17.24 : usmap v3+ (compat CUE4Parse/FModel).
+	FileOutput.Write<uint16_t>(0x30C4);          // magic
+	FileOutput.Write<uint8_t>(3);                // version 3 (support u16 name length)
+	FileOutput.Write<uint8_t>(0);                // bHasVersioning = 0
+	FileOutput.Write(CompressionMethod);         // compression
+	FileOutput.Write<uint32_t>(UsmapData.size());       // compressed size
+	FileOutput.Write<uint32_t>(uint32_t(UsmapData.size())); // decompressed size (= comp car None ; ancienne Buffer.Size() incluait garbage residuel)
 
 	FileOutput.Write(UsmapData.data(), UsmapData.size());
+	Checkpoint(L"P5 done : usmap ECRIT (taille compressed=%zu decompressed=%zu)",
+	           UsmapData.size(), (size_t)Buffer.Size());
+
+	// --- P5b : copie horodatee dans SCHEMAS\versions\<REGION-Version>\dumps\umd\ ---
+	auto ReadClientVersion = []() -> std::string {
+		HANDLE h = CreateFileW(
+			L"C:\\IA\\Aion\\Aion 2\\Client\\AION2_TW\\VersionInfo_A2_TW_L_GA_PURPLE.xml",
+			GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h == INVALID_HANDLE_VALUE) return "TW-_version-inconnue";
+		char buf[2048] = {};
+		DWORD read = 0;
+		ReadFile(h, buf, sizeof(buf) - 1, &read, nullptr);
+		CloseHandle(h);
+		const char* open = strstr(buf, "<Version>");
+		if (!open) return "TW-_version-inconnue";
+		open += 9;
+		const char* close = strstr(open, "</Version>");
+		if (!close || close <= open || (close - open) > 16) return "TW-_version-inconnue";
+		std::string ver(open, close - open);
+		while (!ver.empty() && (ver.back() == ' ' || ver.back() == '\r' || ver.back() == '\n' || ver.back() == '\t'))
+			ver.pop_back();
+		while (!ver.empty() && (ver.front() == ' ' || ver.front() == '\r' || ver.front() == '\n' || ver.front() == '\t'))
+			ver.erase(0, 1);
+		if (ver.empty()) return "TW-_version-inconnue";
+		return "TW-" + ver;
+	};
+
+	std::string versionKey = ReadClientVersion();
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+	char stamp[32];
+	wsprintfA(stamp, "%04d-%02d-%02d-%02dh%02d",
+	          st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+
+	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT-EXTRAIT\\SCHEMAS\\versions\\"
+	                       + versionKey + "\\dumps\\umd";
+	// std::filesystem cree l'arbo entiere (deja inclus dans framework.h, pas de nouvelle dependance).
+	std::error_code fsEc;
+	std::filesystem::create_directories(schemaBase, fsEc);
+
+	std::string schemaFile = schemaBase + "\\Mappings-Aion2-" + stamp + ".usmap";
+
+	auto SchemaOutput = FileWriter(schemaFile.c_str());
+	SchemaOutput.Write<uint16_t>(0x30C4);
+	SchemaOutput.Write<uint8_t>(3);
+	SchemaOutput.Write<uint8_t>(0);
+	SchemaOutput.Write(CompressionMethod);
+	SchemaOutput.Write<uint32_t>(UsmapData.size());
+	SchemaOutput.Write<uint32_t>(uint32_t(UsmapData.size()));
+	SchemaOutput.Write(UsmapData.data(), UsmapData.size());
+
+	wchar_t wSchemaFile[MAX_PATH * 2] = {};
+	MultiByteToWideChar(CP_UTF8, 0, schemaFile.c_str(), -1, wSchemaFile, MAX_PATH * 2);
+	Checkpoint(L"P5b done : usmap AUSSI ECRIT dans %s", wSchemaFile);
 }
