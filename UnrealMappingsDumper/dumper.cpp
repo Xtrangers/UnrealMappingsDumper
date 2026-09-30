@@ -902,19 +902,20 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			buf, sizeof(buf));
 		versionKey = "EU-_version-inconnue";
 		if (n > 0) {
+			// Format ACF Steam : "buildid"\t\t"25624879"\n
+			// Apres la cle "buildid" (fermee par "), on cherche le PROCHAIN " qui
+			// ouvre la valeur, puis le " qui la ferme.
 			const char* op = strstr(buf, "\"buildid\"");
 			if (op) {
-				op = strchr(op + 9, '"');   // apres "buildid"
+				op += 9;                        // saute "buildid" (9 chars)
+				op = strchr(op, '"');           // ouverture de la valeur
 				if (op) {
-					op = strchr(op + 1, '"'); // ouvre "
-					if (op) {
-						op++;
-						const char* cl = strchr(op, '"');
-						if (cl && cl > op && (cl - op) <= 16) {
-							std::string ver(op, cl - op);
-							TrimVerAscii(ver);
-							if (!ver.empty()) versionKey = "EU-" + ver;
-						}
+					op++;                       // debut de la valeur
+					const char* cl = strchr(op, '"'); // fermeture
+					if (cl && cl > op && (cl - op) <= 16) {
+						std::string ver(op, cl - op);
+						TrimVerAscii(ver);
+						if (!ver.empty()) versionKey = "EU-" + ver;
 					}
 				}
 			}
