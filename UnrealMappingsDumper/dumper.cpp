@@ -62,54 +62,110 @@ static bool TryProcessStruct(UStruct* Struct,
 // (2) serialize. Ainsi __try/__except propre.
 static EPropertyType GetPropertyType(FProperty* Prop);  // forward decl
 
+// v0.0.19.15 : validation stricte de chaque FField avant utilisation.
+// Verifie que le Class ET le nom sont lisibles avant d'accepter le FField.
+static bool IsFieldSane(FProperty* Prop) noexcept {
+    __try {
+        if (!IsPtrReadable(Prop)) return false;
+        auto cls = Prop->GetClass();
+        if (!IsPtrReadable(cls)) return false;
+        // Test lecture nom (ne pas capturer, juste s'assurer que ca ne crash pas)
+        auto& fn = Prop->GetFName();
+        (void)fn;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// v0.0.19.16 : collecte la chaine Props en 1 passe SAFE dans un array fixe,
+// puis serialise l'array (pas la chaine). Evite Pass1 != Pass2 en cas de
+// desync partielle du chaine Next.
+template<class NameMapT>
+static uint16_t CollectPropsSafe(UStruct* Struct, FProperty** out, uint16_t maxProps) noexcept {
+    __try {
+        FProperty* Props = Struct->ChildProperties();
+        uint16_t count = 0;
+        while (IsFieldSane(Props) && count < maxProps) {
+            out[count++] = Props;
+            Props = static_cast<FProperty*>(Props->GetNext());
+        }
+        return count;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+template<class NameMapT, class WritePropFn>
+static bool TrySerializeInner(UStruct* Struct, StreamWriter& localBuf,
+    NameMapT& NameMap, WritePropFn& WriteProperty) noexcept
+{
+    // v0.0.19.17 : max 256 props (limite stricte anti-chaine corrompue).
+    // Aion 2 EU : le plus gros struct legitime a ~130 props (AionAbsorbObj etc.)
+    constexpr uint16_t MAX_PROPS = 256;
+    FProperty* propsArray[MAX_PROPS];
+    uint16_t propsCount = CollectPropsSafe<NameMapT>(Struct, propsArray, MAX_PROPS);
+
+
+    __try {
+        localBuf.Write(NameMap[Struct->GetFName()]);
+
+        UStruct* Super = Struct->Super();
+        localBuf.Write<int32_t>(IsPtrReadable(Super) ? NameMap[Super->GetFName()] : int32_t(0xffffffff));
+
+        // Calcule PropCount depuis l'array collecte (pas de re-traversal)
+        uint16_t PropCount = 0;
+        for (uint16_t i = 0; i < propsCount; i++) {
+            PropCount += uint16_t(propsArray[i]->GetArrayDim());
+        }
+        localBuf.Write(PropCount);
+        localBuf.Write(propsCount);
+
+        uint16_t indexAcc = 0;
+        for (uint16_t i = 0; i < propsCount; i++) {
+            FProperty* Props = propsArray[i];
+            uint16_t dim = uint16_t(Props->GetArrayDim());
+            localBuf.Write<uint16_t>(indexAcc);
+            localBuf.Write<uint8_t>(uint8_t(dim));
+            localBuf.Write(NameMap[Props->GetFName()]);
+            EPropertyType t = GetPropertyType(Props);
+            WriteProperty(Props, t, localBuf);
+            indexAcc += dim;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Helper pour lire safe le nom d'un struct
+template<class NameMapT>
+static int32_t GetStructNameIdxSafe(UStruct* Struct, NameMapT& NameMap) noexcept {
+    __try { return NameMap[Struct->GetFName()]; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Wrapper qui gere le StreamWriter local (destructor) et le commit atomique
 template<class NameMapT, class WritePropFn>
 static bool TrySerializeOneStruct(UStruct* Struct, StreamWriter& Buffer,
     NameMapT& NameMap, WritePropFn& WriteProperty) noexcept
 {
     if (!IsPtrReadable(Struct)) return false;
-    __try
-    {
-        Buffer.Write(NameMap[Struct->GetFName()]);
 
-        UStruct* Super = Struct->Super();
-        Buffer.Write<int32_t>(IsPtrReadable(Super) ? NameMap[Super->GetFName()] : int32_t(0xffffffff));
+    StreamWriter localBuf;
+    bool ok = TrySerializeInner(Struct, localBuf, NameMap, WriteProperty);
 
-        // Pass 1 : count PropCount + SerializablePropCount
-        FProperty* first = Struct->ChildProperties();
-        FProperty* Props = first;
-        uint16_t PropCount = 0;
-        uint16_t SerializablePropCount = 0;
-        int guardMax = 4096;
-        while (IsPtrReadable(Props) && guardMax-- > 0)
-        {
-            uint16_t dim = uint16_t(Props->GetArrayDim());
-            PropCount += dim;
-            SerializablePropCount++;
-            Props = static_cast<FProperty*>(Props->GetNext());
-        }
-
-        Buffer.Write(PropCount);
-        Buffer.Write(SerializablePropCount);
-
-        // Pass 2 : serialize
-        Props = first;
-        uint16_t indexAcc = 0;
-        int guardMax2 = 4096;
-        while (IsPtrReadable(Props) && guardMax2-- > 0)
-        {
-            uint16_t dim = uint16_t(Props->GetArrayDim());
-            Buffer.Write<uint16_t>(indexAcc);
-            Buffer.Write<uint8_t>(uint8_t(dim));    // v0.0.19.4 post-maj : u8 pas u16 (CUE4Parse attend byte)
-            Buffer.Write(NameMap[Props->GetFName()]);
-            EPropertyType t = GetPropertyType(Props);
-            WriteProperty(Props, t);
-            indexAcc += dim;
-            Props = static_cast<FProperty*>(Props->GetNext());
-        }
+    if (ok) {
+        std::string localData = localBuf.GetBuffer().str();
+        Buffer.Write((void*)localData.data(), localData.size());
         return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
+    } else {
+        // Placeholder 12 bytes : nameIdx + superIdx=-1 + PC=0 + SP=0
+        int32_t nameIdx = GetStructNameIdxSafe(Struct, NameMap);
+        Buffer.Write(nameIdx);
+        Buffer.Write<int32_t>(int32_t(0xffffffff));
+        Buffer.Write<uint16_t>(0);
+        Buffer.Write<uint16_t>(0);
         return false;
     }
 }
@@ -637,9 +693,9 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	std::vector<UEnum*> Enums;
 	std::vector<UStruct*> Structs; // TODO: a better way than making this completely dynamic
 
-	std::function<void(class FProperty*&, EPropertyType)> WritePropertyWrapper{}; // hacky.. i know
+	std::function<void(class FProperty*&, EPropertyType, StreamWriter&)> WritePropertyWrapper{}; // hacky.. i know
 
-	auto WriteProperty = [&](FProperty*& Prop, EPropertyType Type)
+	auto WriteProperty = [&](FProperty*& Prop, EPropertyType Type, StreamWriter& Buffer)
 	{
 		if (Type == EPropertyType::EnumAsByteProperty)
 			Buffer.Write(EPropertyType::EnumProperty);
@@ -652,71 +708,102 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			auto EnumProp = static_cast<FEnumProperty*>(Prop);
 
 			auto Inner = EnumProp->GetUnderlying();
-			// v0.0.19.11 EU : validation defensive pour eviter crash sur pointeurs
-			// invalides (sous-classes de FProperty avec layout non-standard).
-			if (!IsPtrReadable(Inner)) {
+			// v0.0.19.13 EU : validation renforcee - IsPtrReadable + verif que
+			// GetClass() retourne un objet lisible (pour rejeter les pointeurs
+			// valides mais qui pointent sur du garbage).
+			bool innerOk = false;
+			__try {
+				if (IsPtrReadable(Inner)) {
+					auto cls = Inner->GetClass();
+					if (IsPtrReadable(cls)) innerOk = true;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (!innerOk) {
 				Buffer.Write(EPropertyType::Unknown);
 				Buffer.Write<int32_t>(0);
 				break;
 			}
 			auto InnerType = GetPropertyType(Inner);
-			WritePropertyWrapper(Inner, InnerType);
-			auto EnumObj = EnumProp->GetEnum();
-			if (IsPtrReadable(EnumObj))
-				Buffer.Write(NameMap[EnumObj->GetFName()]);
-			else
-				Buffer.Write<int32_t>(0);
+			WritePropertyWrapper(Inner, InnerType, Buffer);
 
+			int32_t enumNameIdx = 0;
+			__try {
+				auto EnumObj = EnumProp->GetEnum();
+				if (IsPtrReadable(EnumObj)) enumNameIdx = NameMap[EnumObj->GetFName()];
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+			Buffer.Write(enumNameIdx);
 			break;
 		}
 		case EPropertyType::EnumAsByteProperty:
 		{
 			Buffer.Write(EPropertyType::ByteProperty);
-			auto EnumObj = static_cast<FByteProperty*>(Prop)->GetEnum();
-			if (IsPtrReadable(EnumObj))
-				Buffer.Write(NameMap[EnumObj->GetFName()]);
-			else
-				Buffer.Write<int32_t>(0);
-
+			int32_t enumNameIdx = 0;
+			__try {
+				auto EnumObj = static_cast<FByteProperty*>(Prop)->GetEnum();
+				if (IsPtrReadable(EnumObj)) enumNameIdx = NameMap[EnumObj->GetFName()];
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+			Buffer.Write(enumNameIdx);
 			break;
 		}
 		case EPropertyType::StructProperty:
 		{
-			auto StructObj = static_cast<FStructProperty*>(Prop)->GetStruct();
-			if (IsPtrReadable(StructObj))
-				Buffer.Write(NameMap[StructObj->GetFName()]);
-			else
-				Buffer.Write<int32_t>(0);
+			int32_t structNameIdx = 0;
+			__try {
+				auto StructObj = static_cast<FStructProperty*>(Prop)->GetStruct();
+				if (IsPtrReadable(StructObj)) structNameIdx = NameMap[StructObj->GetFName()];
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+			Buffer.Write(structNameIdx);
 			break;
 		}
 		case EPropertyType::SetProperty:
 		case EPropertyType::ArrayProperty:
 		{
-			auto Inner = static_cast<FArrayProperty*>(Prop)->GetInner();
-			if (!IsPtrReadable(Inner)) {
+			bool innerOk = false;
+			FProperty* Inner = nullptr;
+			__try {
+				Inner = static_cast<FArrayProperty*>(Prop)->GetInner();
+				if (IsPtrReadable(Inner)) {
+					auto cls = Inner->GetClass();
+					if (IsPtrReadable(cls)) innerOk = true;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (!innerOk) {
 				Buffer.Write(EPropertyType::Unknown);
 				break;
 			}
 			auto InnerType = GetPropertyType(Inner);
-			WritePropertyWrapper(Inner, InnerType);
-
+			WritePropertyWrapper(Inner, InnerType, Buffer);
 			break;
 		}
 		case EPropertyType::MapProperty:
 		{
-			auto Inner = static_cast<FMapProperty*>(Prop)->GetKey();
-			auto Value = static_cast<FMapProperty*>(Prop)->GetValue();
-			if (!IsPtrReadable(Inner) || !IsPtrReadable(Value)) {
+			bool keyOk = false, valueOk = false;
+			FProperty* Inner = nullptr;
+			FProperty* Value = nullptr;
+			__try {
+				Inner = static_cast<FMapProperty*>(Prop)->GetKey();
+				Value = static_cast<FMapProperty*>(Prop)->GetValue();
+				if (IsPtrReadable(Inner)) {
+					auto c1 = Inner->GetClass();
+					if (IsPtrReadable(c1)) keyOk = true;
+				}
+				if (IsPtrReadable(Value)) {
+					auto c2 = Value->GetClass();
+					if (IsPtrReadable(c2)) valueOk = true;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (!keyOk || !valueOk) {
 				Buffer.Write(EPropertyType::Unknown);
 				Buffer.Write(EPropertyType::Unknown);
 				break;
 			}
 			auto InnerType = GetPropertyType(Inner);
-			WritePropertyWrapper(Inner, InnerType);
-
+			WritePropertyWrapper(Inner, InnerType, Buffer);
 			auto ValueType = GetPropertyType(Value);
-			WritePropertyWrapper(Value, ValueType);
-
+			WritePropertyWrapper(Value, ValueType, Buffer);
 			break;
 		}
 		}
@@ -1030,7 +1117,7 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	Checkpoint(L"P2 done");
 
 	// v0.0.17.13 : boucle Structs de serialisation avec VirtualQuery gate.
-	Checkpoint(L"P3 start : Structs.size=%zu", Structs.size());
+	Checkpoint(L"P3 start V19.16 ATOMIC : Structs.size=%zu", Structs.size());
 	Buffer.Write<uint32_t>(Structs.size());
 
 	// v0.0.17.16 : fonction dediee TrySerializeOneStruct avec __try/__except.
@@ -1044,20 +1131,14 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			Checkpoint(L"P3 Structs iter=%d/%zu (skipped=%d)", structIdx, Structs.size(), structSkipped);
 		structIdx++;
 
-		// v0.0.17.28 : Sauver position AVANT TrySerializeOneStruct. Si crash au
-		// milieu, on rewind et ecrit un placeholder valide 12 bytes -> les prochaines
-		// writes overwritent le garbage. Sans ca le parser lit un struct avec
-		// nameIdx/serPropCount corrompu -> desync.
-		uint32_t posBefore = uint32_t(Buffer.GetBuffer().tellp());
+		// v0.0.19.14 : TrySerializeOneStruct est ATOMIQUE (utilise un StreamWriter
+		// local et n'ecrit dans Buffer que si tout est OK). Sur echec, elle ecrit
+		// elle-meme un placeholder 12 bytes. Plus besoin de rewind ici.
+		uint64_t posBefore = uint64_t(Buffer.GetBuffer().tellp());
 		bool ok = TrySerializeOneStruct(Struct, Buffer, NameMap, WriteProperty);
-		if (!ok) {
-			structSkipped++;
-			Buffer.GetBuffer().seekp(posBefore);  // rewind
-			Buffer.Write<uint32_t>(0);
-			Buffer.Write<int32_t>(int32_t(0xffffffff));
-			Buffer.Write<uint16_t>(0);
-			Buffer.Write<uint16_t>(0);
-		}
+		uint64_t posAfter = uint64_t(Buffer.GetBuffer().tellp());
+		if (!ok) structSkipped++;
+
 	}
 	Checkpoint(L"P3 done : %d skipped", structSkipped);
 
