@@ -3,6 +3,7 @@
 #include "dumper.h"
 #include "writer.h"
 #include "oodle.h"
+#include "aion2Offsets.h"
 
 // v0.0.17.12 : validation runtime pointeur via VirtualQuery — evite les crashes
 // silencieux sur UStruct partiels (heap corruption bypass SEH).
@@ -191,7 +192,11 @@ static void ScanFNamePoolBrut(NameMapT& NameMap,
     HMODULE hAion = GetModuleHandleW(L"Aion2.exe");
     if (!hAion) return;
 
-    uint8_t* pool = (uint8_t*)hAion + 0x0F0791C0;   // v0.0.19.4 : post-maj 09/09/2026 (ancien 0x0EE7AFC0)
+    // v0.0.19.7 : lit l'offset depuis Aion2Offsets (JSON offsets-aion2.json)
+    // au lieu du hardcode 0x0F0791C0 (TW post-maj 09/09/2026) qui ne marche pas
+    // sur EU (0x0F110380). Meme mecanisme que le resolver unrealVersion.h.
+    Aion2Offsets::ChargerUneFois();
+    uint8_t* pool = (uint8_t*)hAion + Aion2Offsets::FNamePool();
     uint32_t currentBlock = *(uint32_t*)(pool + 0x08);
     uint32_t currentByteCursor = *(uint32_t*)(pool + 0x0C);
     uint8_t** blocks = (uint8_t**)(pool + 0x10);
