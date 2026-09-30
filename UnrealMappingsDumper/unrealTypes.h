@@ -364,11 +364,22 @@ public:
 
 private:
 
+	// Layout Aion 2 EU (buildid 25624879, valide 30/09/2026 via umd-struct-layout.log):
+	//   +0x00: Vtbl (8)
+	//   +0x08: ClassPrivate (8)
+	//   +0x10: Owner (16)
+	//   +0x20: NamePrivate (FName, 8)   <- MODIFIE vs vanilla UE 5.3 qui l'avait a +0x28
+	//   +0x28-0x40: flags/padding (24)
+	//   +0x48: Next (FField*, 8)        <- MODIFIE vs vanilla UE 5.3 qui l'avait a +0x20
+	// Ces offsets sont OBSERVES sur EU. Sur TW ils etaient probablement vanilla.
+	// Si probleme de compat TW/EU dans le futur, faire un dispatch selon un flag.
+
 	void* Vtbl;
 	FFieldClass* ClassPrivate;
 	Variant Owner;
-	FField* Next;
-	FName NamePrivate;
+	FName NamePrivate;              // deplace en +0x20 sur EU
+	uint8_t _padAfterName[0x20];    // +0x28 flags/padding (24 bytes + alignement)
+	FField* Next;                   // en +0x48 sur EU
 	EObjectFlags FlagsPrivate;
 
 public:

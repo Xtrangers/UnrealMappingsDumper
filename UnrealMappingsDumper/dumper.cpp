@@ -399,6 +399,146 @@ struct FPropertyData
 	}
 };
 
+// v0.0.19.8 : DIAG offsets UStruct/FProperty pour Aion 2 EU.
+// Fonction free noexcept avec __try (evite C2712 dans Dumper::Run).
+static void DumpStructLayoutDiag(const std::vector<UStruct*>& Structs,
+                                 const std::vector<UEnum*>& Enums) noexcept
+{
+	HANDLE hDiag = CreateFileW(L"C:\\Users\\Public\\umd-struct-layout.log",
+		GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hDiag == INVALID_HANDLE_VALUE) return;
+
+	wchar_t bom = 0xFEFF;
+	DWORD w = 0;
+	WriteFile(hDiag, &bom, sizeof(bom), &w, nullptr);
+
+	auto WriteLine = [&](const wchar_t* buf, int n) {
+		if (n > 0) WriteFile(hDiag, buf, n * sizeof(wchar_t), &w, nullptr);
+		const wchar_t* nl = L"\r\n";
+		WriteFile(hDiag, nl, 4, &w, nullptr);
+	};
+
+	{
+		wchar_t line[256];
+		int n = swprintf_s(line, 256, L"=== UMD STRUCT LAYOUT DIAG (v0.0.19.8) ===");
+		WriteLine(line, n);
+		n = swprintf_s(line, 256, L"Structs.size = %zu, Enums.size = %zu",
+			Structs.size(), Enums.size());
+		WriteLine(line, n);
+		n = swprintf_s(line, 256, L"Offsets UMD hardcodes : Name=0x18 Class=0x10 Super=0x40 ChildProps=0x50 PropsSize=0x58");
+		WriteLine(line, n);
+		WriteLine(L"", 0);
+	}
+
+	// v0.0.19.9 : inspecte 3 premiers + indices 100, 500, 2000, 5000, 10000
+	// (les 3 premiers sont Object/Interface/EditorPathObjectInterface qui n'ont
+	// pas de proprietes -> on veut voir des structs gameplay).
+	size_t indices[] = { 0, 1, 2, 100, 500, 2000, 5000, 10000 };
+	for (size_t idxIdx = 0; idxIdx < 8; idxIdx++) {
+		size_t sIdx = indices[idxIdx];
+		if (sIdx >= Structs.size()) continue;
+		UStruct* S = Structs[sIdx];
+		int inspected = (int)sIdx;
+		__try {
+			if (!IsPtrReadable(S)) continue;
+
+			const uint8_t* raw = (const uint8_t*)S;
+			wchar_t line[512];
+
+			int n = swprintf_s(line, 512, L"--- Struct #%d @ 0x%p ---", inspected, S);
+			WriteLine(line, n);
+
+			// Dump 128 bytes bruts hex
+			for (int i = 0; i < 128; i += 16) {
+				wchar_t hexline[256] = {};
+				int hp = swprintf_s(hexline, 256, L"  +%04X: ", i);
+				for (int j = 0; j < 16; j++) {
+					hp += swprintf_s(hexline + hp, 256 - hp, L"%02X ", raw[i + j]);
+				}
+				hp += swprintf_s(hexline + hp, 256 - hp, L" |");
+				for (int j = 0; j < 16; j++) {
+					uint8_t b = raw[i + j];
+					hexline[hp++] = (b >= 32 && b < 127) ? (wchar_t)b : L'.';
+				}
+				hexline[hp++] = L'|';
+				hexline[hp] = 0;
+				WriteLine(hexline, hp);
+			}
+
+			// Reads a offsets UMD
+			uint64_t nameFName = *(uint64_t*)(raw + 0x18);
+			uint64_t classVal = *(uint64_t*)(raw + 0x10);
+			uint64_t superVal = *(uint64_t*)(raw + 0x40);
+			uint64_t childProps = *(uint64_t*)(raw + 0x50);
+			int32_t propSize = *(int32_t*)(raw + 0x58);
+
+			n = swprintf_s(line, 512, L"Reads: Class=0x%llX Name=0x%llX Super=0x%llX ChildProps=0x%llX PropsSize=%d",
+				classVal, nameFName, superVal, childProps, propSize);
+			WriteLine(line, n);
+
+			// Nom via GetFName
+			auto fname_str = S->GetFName().AsString();
+			n = swprintf_s(line, 512, L"GetFName().AsString() = '%.*s'", (int)fname_str.size(), fname_str.data());
+			WriteLine(line, n);
+
+			// Follow ChildProperties si valide
+			if (childProps && IsPtrReadable((void*)childProps)) {
+				const uint8_t* propRaw = (const uint8_t*)childProps;
+				n = swprintf_s(line, 512, L"1er FProperty @ 0x%llX :", childProps);
+				WriteLine(line, n);
+
+				// Dump 128 bytes FProperty (au lieu de 64)
+				for (int i = 0; i < 128; i += 16) {
+					wchar_t hexline[256] = {};
+					int hp = swprintf_s(hexline, 256, L"  +%04X: ", i);
+					for (int j = 0; j < 16; j++) {
+						hp += swprintf_s(hexline + hp, 256 - hp, L"%02X ", propRaw[i + j]);
+					}
+					hp += swprintf_s(hexline + hp, 256 - hp, L" |");
+					for (int j = 0; j < 16; j++) {
+						uint8_t b = propRaw[i + j];
+						hexline[hp++] = (b >= 32 && b < 127) ? (wchar_t)b : L'.';
+					}
+					hexline[hp++] = L'|';
+					hexline[hp] = 0;
+					WriteLine(hexline, hp);
+				}
+
+				// Tente de resoudre chaque uint32 possible comme FName ID
+				// et logge le nom si le resolver retourne quelque chose
+				WriteLine(L"Test resolveur : essai de chaque u32 comme FName ID", 50);
+				for (int offset = 0x10; offset <= 0x40; offset += 4) {
+					uint32_t maybe_id = *(uint32_t*)(propRaw + offset);
+					if (maybe_id == 0 || maybe_id > 10000000) continue;
+					// Construit un faux FName sur la stack pour appeler resolver
+					uint32_t fname_data[3] = { maybe_id, 0, 0 };
+					FName fake_name(0);
+					memcpy(&fake_name, fname_data, sizeof(FName));
+					auto ns = fake_name.AsString();
+					if (!ns.empty()) {
+						n = swprintf_s(line, 512, L"  +%02X u32=%u -> '%.*s'",
+							offset, maybe_id, (int)ns.size(), ns.data());
+						WriteLine(line, n);
+					}
+				}
+			} else {
+				WriteLine(L"ChildProps=0 ou invalide, pas de sous-inspection", 40);
+			}
+			WriteLine(L"", 0);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			wchar_t line[128];
+			int n = swprintf_s(line, 128, L"SEH sur struct #%d, skip", inspected);
+			WriteLine(line, n);
+		}
+	}
+
+	WriteLine(L"=== FIN DIAG ===", 15);
+	FlushFileBuffers(hDiag);
+	CloseHandle(hDiag);
+}
+
 void Dumper::Run(ECompressionMethod CompressionMethod)
 {
 	StreamWriter Buffer;
@@ -675,6 +815,9 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 		FlushFileBuffers(h);
 		CloseHandle(h);
 	};
+
+	// v0.0.19.8 : Phase P0-PRE DIAG offsets UStruct/FProperty pour Aion 2 EU.
+	DumpStructLayoutDiag(Structs, Enums);
 
 	// v0.0.17.20 : Phase P0 Enrichment — populate NameMap avec Super+Props (Structs)
 	// et EnumNames (Enums), boucles SEPAREES du ForEach avec checkpoints toutes les
