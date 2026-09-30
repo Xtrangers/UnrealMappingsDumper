@@ -1167,28 +1167,12 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	}
 	Checkpoint(L"P4 done : UsmapData.size=%zu", UsmapData.size());
 
-	// v0.0.17.25 (30/09/2026) : ecrit dans DEUX endroits.
-	//   1. C:\Users\Public\Mappings-Aion2.usmap  (compat + fallback historique)
-	//   2. CLIENT-EXTRAIT\SCHEMAS\versions\<REGION-Version>\dumps\umd\Mappings-Aion2-<ts>.usmap
-	//      (rangement par version du client Aion 2, cf. reorg 30/09/2026)
-	//
-	// Lit la version dynamiquement dans :
-	//   C:\IA\Aion\Aion 2\Client\AION2_TW\VersionInfo_A2_TW_L_GA_PURPLE.xml (balise <Version>)
-	//   -> cle "TW-<version>", fallback "TW-_version-inconnue" sinon.
-	Checkpoint(L"P5 start WriteFile usmap");
-	auto FileOutput = FileWriter("C:\\Users\\Public\\Mappings-Aion2.usmap");
-
-	// v0.0.17.24 : usmap v3+ (compat CUE4Parse/FModel).
-	FileOutput.Write<uint16_t>(0x30C4);          // magic
-	FileOutput.Write<uint8_t>(3);                // version 3 (support u16 name length)
-	FileOutput.Write<uint8_t>(0);                // bHasVersioning = 0
-	FileOutput.Write(CompressionMethod);         // compression
-	FileOutput.Write<uint32_t>(UsmapData.size());       // compressed size
-	FileOutput.Write<uint32_t>(uint32_t(UsmapData.size())); // decompressed size (= comp car None ; ancienne Buffer.Size() incluait garbage residuel)
-
-	FileOutput.Write(UsmapData.data(), UsmapData.size());
-	Checkpoint(L"P5 done : usmap ECRIT (taille compressed=%zu decompressed=%zu)",
-	           UsmapData.size(), (size_t)Buffer.Size());
+	// v0.0.19.8 (30/09/2026) : ecrit UNIQUEMENT dans l'emplacement version-scope.
+	// CLIENT-EXTRAIT\SCHEMAS\versions\<REGION-Version>\dumps\umd\Mappings-Aion2-<ts>.usmap
+	// L'ancien fallback C:\Users\Public\Mappings-Aion2.usmap est supprime pour
+	// eviter la confusion (deux fichiers = deux verites, l'un ecrasant l'autre a
+	// chaque dump). La suite (P5b) fait l'ecriture reelle.
+	Checkpoint(L"P5 done : UsmapData prete pour P5b (taille=%zu)", UsmapData.size());
 
 	// --- P5b : copie horodatee dans SCHEMAS\versions\<REGION-Version>\dumps\umd\ ---
 	//
