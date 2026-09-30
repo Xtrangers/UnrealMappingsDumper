@@ -39,7 +39,9 @@ static void ManualFNameToString_Aion2(const void* pThis, FString& Out) noexcept
 
 	if (blockIdx >= 8192) return;
 
-	HMODULE hAion = GetModuleHandleW(L"Aion2.exe");
+	// nullptr = module courant (l'exe injecte, quel que soit son nom).
+	// Sur TW = "Aion2.exe", sur EU = "AION2.exe". nullptr marche pour les deux.
+	HMODULE hAion = GetModuleHandleW(nullptr);
 	if (!hAion) return;
 
 	uint8_t*  pool   = (uint8_t*)hAion + Aion2Offsets::FNamePool();   // D.11 : lu depuis offsets-aion2.json (fallback 0x0F1071C0)
@@ -227,12 +229,19 @@ public:
 		{
 			wchar_t modName[MAX_PATH] = {0};
 			GetModuleFileNameW(nullptr, modName, MAX_PATH);
-			if (wcsstr(modName, L"Aion2.exe") != nullptr)
+			// Case-insensitive : TW = "Aion2.exe", EU = "AION2.exe".
+			// Comparaison en lower-case pour matcher les deux.
+			wchar_t modNameLower[MAX_PATH] = {0};
+			for (int i = 0; i < MAX_PATH && modName[i]; ++i) {
+				wchar_t c = modName[i];
+				modNameLower[i] = (c >= L'A' && c <= L'Z') ? (c + 32) : c;
+			}
+			if (wcsstr(modNameLower, L"aion2.exe") != nullptr)
 			{
 				FNameToString = ManualFNameToString_Aion2;
 				FNameStringAddy = (uintptr_t)&ManualFNameToString_Aion2;
 				aion2ManualOverride = true;
-				UE_LOG("[AION2] FNamePool direct override (Plan B v0.0.17.2) — no UE call");
+				UE_LOG("[AION2] FNamePool direct override (Plan B v0.0.17.2) - no UE call");
 			}
 		}
 
@@ -241,7 +250,8 @@ public:
 		// d'autres régions (heap, autres DLLs) → CALL to invalid → AV 0xC0000005.
 		uintptr_t aion_base = 0, aion_end = 0;
 		{
-			HMODULE h = GetModuleHandleW(L"Aion2.exe");
+			// nullptr = module courant (marche pour Aion2.exe TW et AION2.exe EU)
+			HMODULE h = GetModuleHandleW(nullptr);
 			if (h) {
 				auto dos = (PIMAGE_DOS_HEADER)h;
 				auto nt = (PIMAGE_NT_HEADERS64)((BYTE*)h + dos->e_lfanew);

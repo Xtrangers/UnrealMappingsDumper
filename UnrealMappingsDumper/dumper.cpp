@@ -189,7 +189,8 @@ static void ScanFNamePoolBrut(NameMapT& NameMap,
                                int& outBlocks, int& outNames, int& outSkip) noexcept
 {
     outBlocks = 0; outNames = 0; outSkip = 0;
-    HMODULE hAion = GetModuleHandleW(L"Aion2.exe");
+    // nullptr = module courant (marche pour Aion2.exe TW et AION2.exe EU)
+    HMODULE hAion = GetModuleHandleW(nullptr);
     if (!hAion) return;
 
     // v0.0.19.7 : lit l'offset depuis Aion2Offsets (JSON offsets-aion2.json)
