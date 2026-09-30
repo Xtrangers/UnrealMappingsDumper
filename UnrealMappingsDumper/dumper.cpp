@@ -565,6 +565,65 @@ static void DumpStructLayoutDiag(const std::vector<UStruct*>& Structs,
 		}
 	}
 
+	// v0.0.19.11 : diag UEnum layout
+	WriteLine(L"", 0);
+	WriteLine(L"=== UENUM LAYOUT DIAG ===", 25);
+	for (int ei = 0; ei < 3 && ei < (int)Enums.size(); ei++) {
+		UEnum* E = Enums[ei];
+		__try {
+			if (!IsPtrReadable(E)) continue;
+			const uint8_t* raw = (const uint8_t*)E;
+			wchar_t line[512];
+			auto ns = E->GetFName().AsString();
+			int n = swprintf_s(line, 512, L"UEnum #%d @ 0x%p name='%.*s'",
+				ei, E, (int)ns.size(), ns.data());
+			WriteLine(line, n);
+
+			// Dump 256 bytes
+			for (int i = 0; i < 256; i += 16) {
+				wchar_t hexline[256] = {};
+				int hp = swprintf_s(hexline, 256, L"  +%04X: ", i);
+				for (int j = 0; j < 16; j++) {
+					hp += swprintf_s(hexline + hp, 256 - hp, L"%02X ", raw[i + j]);
+				}
+				hp += swprintf_s(hexline + hp, 256 - hp, L" |");
+				for (int j = 0; j < 16; j++) {
+					uint8_t b = raw[i + j];
+					hexline[hp++] = (b >= 32 && b < 127) ? (wchar_t)b : L'.';
+				}
+				hexline[hp++] = L'|';
+				hexline[hp] = 0;
+				WriteLine(hexline, hp);
+			}
+
+			// Cherche TArray pattern : { void* + int32 + int32 } avec int32 > 0 et < 1000
+			WriteLine(L"Recherche TArray pattern (ptr + Num + Max):", 45);
+			for (int off = 0x30; off <= 0xE0; off += 8) {
+				uint64_t ptr = *(uint64_t*)(raw + off);
+				int32_t num = *(int32_t*)(raw + off + 8);
+				int32_t max = *(int32_t*)(raw + off + 12);
+				if (num > 0 && num < 1000 && max >= num && ptr != 0) {
+					n = swprintf_s(line, 512, L"  +0x%02X : ptr=0x%llX Num=%d Max=%d - CANDIDAT",
+						off, ptr, num, max);
+					WriteLine(line, n);
+					// Essaie de lire le 1er element : {FName, int64}
+					if (IsPtrReadable((void*)ptr)) {
+						uint32_t fn0 = *(uint32_t*)ptr;
+						int64_t v0 = *(int64_t*)(ptr + sizeof(FName));
+						uint32_t fname_data[3] = { fn0, 0, 0 };
+						FName fake_name(0);
+						memcpy(&fake_name, fname_data, sizeof(FName));
+						auto rns = fake_name.AsString();
+						n = swprintf_s(line, 512, L"    -> [0].name='%.*s' val=%lld",
+							(int)rns.size(), rns.data(), v0);
+						WriteLine(line, n);
+					}
+				}
+			}
+			WriteLine(L"", 0);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
 	WriteLine(L"=== FIN DIAG ===", 15);
 	FlushFileBuffers(hDiag);
 	CloseHandle(hDiag);
@@ -593,28 +652,51 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			auto EnumProp = static_cast<FEnumProperty*>(Prop);
 
 			auto Inner = EnumProp->GetUnderlying();
+			// v0.0.19.11 EU : validation defensive pour eviter crash sur pointeurs
+			// invalides (sous-classes de FProperty avec layout non-standard).
+			if (!IsPtrReadable(Inner)) {
+				Buffer.Write(EPropertyType::Unknown);
+				Buffer.Write<int32_t>(0);
+				break;
+			}
 			auto InnerType = GetPropertyType(Inner);
 			WritePropertyWrapper(Inner, InnerType);
-			Buffer.Write(NameMap[EnumProp->GetEnum()->GetFName()]);
+			auto EnumObj = EnumProp->GetEnum();
+			if (IsPtrReadable(EnumObj))
+				Buffer.Write(NameMap[EnumObj->GetFName()]);
+			else
+				Buffer.Write<int32_t>(0);
 
 			break;
 		}
 		case EPropertyType::EnumAsByteProperty:
 		{
 			Buffer.Write(EPropertyType::ByteProperty);
-			Buffer.Write(NameMap[static_cast<FByteProperty*>(Prop)->GetEnum()->GetFName()]);
+			auto EnumObj = static_cast<FByteProperty*>(Prop)->GetEnum();
+			if (IsPtrReadable(EnumObj))
+				Buffer.Write(NameMap[EnumObj->GetFName()]);
+			else
+				Buffer.Write<int32_t>(0);
 
 			break;
 		}
 		case EPropertyType::StructProperty:
 		{
-			Buffer.Write(NameMap[static_cast<FStructProperty*>(Prop)->GetStruct()->GetFName()]);
+			auto StructObj = static_cast<FStructProperty*>(Prop)->GetStruct();
+			if (IsPtrReadable(StructObj))
+				Buffer.Write(NameMap[StructObj->GetFName()]);
+			else
+				Buffer.Write<int32_t>(0);
 			break;
 		}
 		case EPropertyType::SetProperty:
 		case EPropertyType::ArrayProperty:
 		{
 			auto Inner = static_cast<FArrayProperty*>(Prop)->GetInner();
+			if (!IsPtrReadable(Inner)) {
+				Buffer.Write(EPropertyType::Unknown);
+				break;
+			}
 			auto InnerType = GetPropertyType(Inner);
 			WritePropertyWrapper(Inner, InnerType);
 
@@ -623,10 +705,15 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 		case EPropertyType::MapProperty:
 		{
 			auto Inner = static_cast<FMapProperty*>(Prop)->GetKey();
+			auto Value = static_cast<FMapProperty*>(Prop)->GetValue();
+			if (!IsPtrReadable(Inner) || !IsPtrReadable(Value)) {
+				Buffer.Write(EPropertyType::Unknown);
+				Buffer.Write(EPropertyType::Unknown);
+				break;
+			}
 			auto InnerType = GetPropertyType(Inner);
 			WritePropertyWrapper(Inner, InnerType);
 
-			auto Value = static_cast<FMapProperty*>(Prop)->GetValue();
 			auto ValueType = GetPropertyType(Value);
 			WritePropertyWrapper(Value, ValueType);
 

@@ -448,9 +448,11 @@ public:
 
 	EnumNameMap& Names()
 	{
-		static auto FieldSize = ObjObjects::FindObject<UStruct>(L"/Script/CoreUObject.Field")->PropertiesSize();
-
-		return QUICK_OFFSET(EnumNameMap, FieldSize + sizeof(FString));
+		// v0.0.19.12 : Aion 2 EU - Names est a +0x40 (verifie via
+		// umd-struct-layout.log diag5 : EAutomationEventType +0x40 = 'Info',
+		// ERangeBoundTypes +0x40 = 'Exclusive'). Vanilla UE 5.3 utilisait
+		// FieldSize + sizeof(FString) qui ne matche pas sur EU.
+		return QUICK_OFFSET(EnumNameMap, 0x40);
 	}
 
 	DECLARE_STATIC_CLASS(L"/Script/CoreUObject.Enum");
