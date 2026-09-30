@@ -9,10 +9,21 @@
 
 #define QUICK_OFFSET(type, offset) (*(type*)((uintptr_t)this + offset))
 
+// v0.0.17.2 PATCH AION 2 : FindObjectByName (juste nom) au lieu de FindObject (path
+// complet). Le GetPath() d'Aion 2 construit un path different de "/Script/CoreUObject.X",
+// alors que les noms "Class", "ScriptStruct", "Enum" sont uniques dans le pool.
+// La macro accepte encore le PATH complet en argument pour ne pas casser d'autres
+// invocations existantes ; on extrait le "shortName" apres le dernier '.' via
+// runtime helper WcsLastToken.
+static FORCEINLINE const wchar_t* WcsLastToken(const wchar_t* s) {
+	const wchar_t* last = s;
+	for (const wchar_t* p = s; *p; ++p) if (*p == L'.' || *p == L'/') last = p + 1;
+	return last;
+}
 #define DECLARE_STATIC_CLASS(PATH) \
     static FORCEINLINE class UClass* StaticClass() \
 	{ \
-		static auto Inst = ObjObjects::FindObject<class UClass>(PATH); \
+		static auto Inst = ObjObjects::FindObjectByName<class UClass>(WcsLastToken(PATH)); \
 		return Inst; \
 	} \
 
@@ -51,10 +62,34 @@ public:
 		return size_t(p.Number);
 	}
 
+	// AION2 : counter SEH pour proteger le call qui crash parfois
+	// (FName::AppendString inline en LTCG => hardcoded RVA peut etre faux).
+	// On log le nb de crashes et retourne empty au lieu de tuer Aion2.
+	static inline volatile long s_FNameCrashCount = 0;
+	static inline volatile long s_FNameCallCount = 0;
+
+	static bool SafeCallFNameToString_impl(const void* pThis, FString& Out) noexcept
+	{
+		__try {
+			FNameToString(pThis, Out);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
 	std::wstring_view AsString() const
 	{
 		FString Ret;
-		FNameToString(this, Ret);
+		InterlockedIncrement(&s_FNameCallCount);
+
+		if (!SafeCallFNameToString_impl(this, Ret))
+		{
+			InterlockedIncrement(&s_FNameCrashCount);
+			// Log est fait apres le dump dans dumper.cpp via les compteurs statiques
+			return {};
+		}
 
 		if (Ret.Data() != nullptr)
 		{
