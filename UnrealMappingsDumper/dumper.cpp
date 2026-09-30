@@ -522,6 +522,37 @@ static void DumpStructLayoutDiag(const std::vector<UStruct*>& Structs,
 						WriteLine(line, n);
 					}
 				}
+
+				// v0.0.19.10 : Follow chain Next a +0x48 sur 5 FField successifs
+				// Dumpe 32 bytes au debut de chaque, resout le nom
+				WriteLine(L"", 0);
+				WriteLine(L"Chain Next @ +0x48 (5 premiers FField) :", 50);
+				const uint8_t* cur = propRaw;
+				for (int k = 0; k < 5; k++) {
+					if (!IsPtrReadable(cur)) {
+						n = swprintf_s(line, 512, L"  [%d] 0x%p NON READABLE", k, cur);
+						WriteLine(line, n);
+						break;
+					}
+					uint32_t nid = *(uint32_t*)(cur + 0x20);
+					uint32_t fname_data[3] = { nid, 0, 0 };
+					FName fake_name(0);
+					memcpy(&fake_name, fname_data, sizeof(FName));
+					auto ns = fake_name.AsString();
+					n = swprintf_s(line, 512, L"  [%d] @ 0x%p nid=%u name='%.*s'",
+						k, cur, nid, (int)ns.size(), ns.data());
+					WriteLine(line, n);
+					// Dump les 32 premiers bytes de ce FField
+					wchar_t hexline[128] = {};
+					int hp = swprintf_s(hexline, 128, L"       ");
+					for (int j = 0; j < 32; j++) {
+						hp += swprintf_s(hexline + hp, 128 - hp, L"%02X ", cur[j]);
+					}
+					WriteLine(hexline, hp);
+					// Move to Next
+					uint64_t nextPtr = *(uint64_t*)(cur + 0x48);
+					cur = (const uint8_t*)nextPtr;
+				}
 			} else {
 				WriteLine(L"ChildProps=0 ou invalide, pas de sous-inspection", 40);
 			}

@@ -367,20 +367,23 @@ private:
 	// Layout Aion 2 EU (buildid 25624879, valide 30/09/2026 via umd-struct-layout.log):
 	//   +0x00: Vtbl (8)
 	//   +0x08: ClassPrivate (8)
-	//   +0x10: Owner (16)
-	//   +0x20: NamePrivate (FName, 8)   <- MODIFIE vs vanilla UE 5.3 qui l'avait a +0x28
-	//   +0x28-0x40: flags/padding (24)
-	//   +0x48: Next (FField*, 8)        <- MODIFIE vs vanilla UE 5.3 qui l'avait a +0x20
-	// Ces offsets sont OBSERVES sur EU. Sur TW ils etaient probablement vanilla.
-	// Si probleme de compat TW/EU dans le futur, faire un dispatch selon un flag.
+	//   +0x10: Owner (Variant, 16)
+	//   +0x20: NamePrivate (FName, 8)      <- MODIFIE vs vanilla UE 5.3 (+0x28)
+	//   +0x28: FlagsPrivate (u32) + pad (4) (8)
+	//
+	// FProperty EU (herite FField):
+	//   +0x30: ArrayDim (u32)               <- observe = 1 sur tous les samples
+	//   +0x34: ElementSize (u32)
+	//   +0x38-0x40: PropertyFlags + RepIndex + autres
+	//   +0x48: Next (FField*, 8)            <- observe pointe sur FField suivant
+	// FField total : 0x30 bytes. FProperty total EU : 0x50 bytes.
 
 	void* Vtbl;
 	FFieldClass* ClassPrivate;
 	Variant Owner;
-	FName NamePrivate;              // deplace en +0x20 sur EU
-	uint8_t _padAfterName[0x20];    // +0x28 flags/padding (24 bytes + alignement)
-	FField* Next;                   // en +0x48 sur EU
-	EObjectFlags FlagsPrivate;
+	FName NamePrivate;              // +0x20
+	uint32_t FlagsPrivate_padded;   // +0x28 (u32) + reserved 4 bytes pour tenir en 8
+	uint32_t _reserved_2C;          // +0x2C
 
 public:
 
@@ -391,7 +394,8 @@ public:
 
 	FORCEINLINE FField* GetNext() const
 	{
-		return Next;
+		// Next est en +0x48 sur EU (au sein du sous-type FProperty)
+		return *(FField* const*)((const uint8_t*)this + 0x48);
 	}
 
 	FORCEINLINE FFieldClass* GetClass() const
@@ -405,8 +409,7 @@ public:
 		{
 			return QUICK_OFFSET(EObjectFlags, offsetof(FField, NamePrivate) + 4);
 		}
-
-		return FlagsPrivate;
+		return (EObjectFlags)FlagsPrivate_padded;
 	}
 };
 
@@ -414,7 +417,10 @@ class FProperty : public FField
 {
 private:
 
-	int32_t ArrayDim;
+	// FField vanilla se termine a 0x30. Sur EU FField = 0x30 aussi.
+	// FProperty::ArrayDim est directement apres.
+	uint32_t ArrayDim;      // +0x30
+	uint32_t ElementSize;   // +0x34
 
 protected:
 
@@ -430,8 +436,7 @@ public:
 		{
 			return QUICK_OFFSET(int32_t, sizeof(FField) - 8);
 		}
-
-		return ArrayDim;
+		return (int32_t)ArrayDim;
 	}
 };
 
