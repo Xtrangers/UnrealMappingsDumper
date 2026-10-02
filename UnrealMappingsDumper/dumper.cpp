@@ -1087,6 +1087,61 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	}
 	Checkpoint(L"P1 done : %d names ecrits", CurrentNameIndex);
 
+	// v0.0.19.28 : SECURITE post-patch — refuse d'ecrire un dump incomplet.
+	// Si Structs OU Enums est vide, les offsets GObjects/FNamePool/GWorld sont
+	// probablement obsoletes (patch client Aion 2). Mieux vaut aucun fichier
+	// qu'un .usmap tronque qu'on confondra plus tard avec un vrai dump.
+	if (Structs.size() == 0 || Enums.size() == 0)
+	{
+		Checkpoint(L"ABANDON : dump INCOMPLET - Structs.size=%zu Enums.size=%zu "
+		           L"- probable nouveaux offsets Aion 2 apres un patch client. "
+		           L"Lance AION2 Studio -> onglet Scan Offsets pour rescanner "
+		           L"GObjects/FNamePool/GWorld, puis mets a jour offsets-aion2.json.",
+		           Structs.size(), Enums.size());
+
+		// Ecrit un marqueur texte a cote (dans %TEMP%) pour que SysUtil
+		// puisse detecter l'abandon et avertir l'operateur.
+		wchar_t tmp[MAX_PATH] = {};
+		DWORD nTmp = GetTempPathW(MAX_PATH, tmp);
+		if (nTmp > 0 && nTmp < MAX_PATH)
+		{
+			wchar_t marker[MAX_PATH] = {};
+			for (DWORD i = 0; i < nTmp && i < MAX_PATH - 32; ++i) marker[i] = tmp[i];
+			const wchar_t fname[] = L"umd-abandon-offsets-invalides.txt";
+			DWORD ml = 0;
+			while (marker[ml]) ++ml;
+			for (int j = 0; fname[j] && ml < MAX_PATH - 1; ++j) marker[ml++] = fname[j];
+			marker[ml] = 0;
+
+			HANDLE h = CreateFileW(marker, GENERIC_WRITE, 0, nullptr,
+				CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h != INVALID_HANDLE_VALUE)
+			{
+				char msg[512] = {};
+				int len = wsprintfA(msg,
+					"UMD a abandonne : Structs=%zu Enums=%zu.\r\n"
+					"Les offsets Aion 2 sont probablement obsoletes (patch client).\r\n"
+					"Lance AION2 Studio -> Scan Offsets, puis relance ce dump.\r\n",
+					Structs.size(), Enums.size());
+				DWORD w = 0;
+				WriteFile(h, msg, len, &w, nullptr);
+				CloseHandle(h);
+			}
+		}
+		return; // ne pas ecrire le .usmap
+	}
+
+	// Sanity check additionnel : seuils plausibles pour Aion 2.
+	// Un dump sain = ~14 000 structs et ~2 600 enums. En dessous de 1000/100
+	// on considere que les offsets ont partiellement foire.
+	if (Structs.size() < 1000 || Enums.size() < 100)
+	{
+		Checkpoint(L"AVERTISSEMENT : dump sous-dimensionne (Structs=%zu, Enums=%zu). "
+		           L"Attendu ~14k structs / ~2.6k enums. Verifier offsets apres patch client.",
+		           Structs.size(), Enums.size());
+		// On ecrit quand meme — ce peut etre un cas limite (dump tres tot au boot).
+	}
+
 	Checkpoint(L"P2 start : Enums.size=%zu", Enums.size());
 	Buffer.Write<uint32_t>(Enums.size());
 
