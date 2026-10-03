@@ -770,13 +770,35 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			Buffer.Write(structNameIdx);
 			break;
 		}
-		case EPropertyType::SetProperty:
 		case EPropertyType::ArrayProperty:
 		{
 			bool innerOk = false;
 			FProperty* Inner = nullptr;
 			__try {
 				Inner = static_cast<FArrayProperty*>(Prop)->GetInner();
+				if (IsPtrReadable(Inner)) {
+					auto cls = Inner->GetClass();
+					if (IsPtrReadable(cls)) innerOk = true;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (!innerOk) {
+				Buffer.Write(EPropertyType::Unknown);
+				break;
+			}
+			auto InnerType = GetPropertyType(Inner);
+			WritePropertyWrapper(Inner, InnerType, Buffer);
+			break;
+		}
+		case EPropertyType::SetProperty:
+		{
+			// FSetProperty layout different de FArrayProperty :
+			// pas de EArrayPropertyFlags, donc ElementProp (= Inner) est a
+			// FPropertySize sans l'ArrayInnerExtraOffset du reorder UE 5.3+.
+			bool innerOk = false;
+			FProperty* Inner = nullptr;
+			__try {
+				Inner = static_cast<FSetProperty*>(Prop)->GetInner();
 				if (IsPtrReadable(Inner)) {
 					auto cls = Inner->GetClass();
 					if (IsPtrReadable(cls)) innerOk = true;

@@ -510,6 +510,18 @@ public:
 	}
 };
 
+// FSetProperty = { FProperty* ElementProp; FScriptSetLayout SetLayout; }
+// Pas de reorder UE 5.3 ici (contrairement a FArrayProperty qui a
+// ArrayFlags), donc ElementProp est toujours a FPropertySize.
+class FSetProperty : public FProperty
+{
+public:
+	FORCEINLINE FProperty* GetInner()
+	{
+		return QUICK_OFFSET(FProperty*, FPropertySize);
+	}
+};
+
 class FMapProperty : public FProperty
 {
 	FProperty* KeyProp;
