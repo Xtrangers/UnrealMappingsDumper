@@ -490,14 +490,20 @@ class FArrayProperty : public FProperty
 		UsesMemoryImageAllocator
 	};
 
-	FProperty* Inner;
+	// UE 5.3 : l'ordre a ete inverse par rapport a 5.2 et avant.
+	// Avant 5.3 : { FProperty* Inner; EArrayPropertyFlags ArrayFlags; }
+	// En 5.3    : { EArrayPropertyFlags ArrayFlags; FProperty* Inner; }
+	// Donc Inner est a FPropertySize + 8 (apres ArrayFlags + padding 4 octets).
+	// Source : UEDumper #if UE_VERSION < UE_5_03.
 	EArrayPropertyFlags ArrayFlags;
+	FProperty* Inner;
 
 public:
 
 	FORCEINLINE FProperty* GetInner()
 	{
-		return QUICK_OFFSET(FProperty*, FPropertySize);
+		// Inner apres ArrayFlags (int32) + padding : offset total = FPropertySize + 8.
+		return QUICK_OFFSET(FProperty*, FPropertySize + 0x8);
 	}
 };
 

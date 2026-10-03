@@ -347,12 +347,28 @@ public:
 
 struct UnrealVersionBase : IUnrealVersion
 {
-	// Aion 2 EU (30/09/2026, buildid 25624879) : FProperty fait 0x80 bytes
-	// (verifie via diff d'adresses successives dans umd-struct-layout.log :
-	//  RigVMFunction Value->Count = 0x80, InputSettings AxisConfig->PlatformSettings = 0x80,
-	//  AionWidget P_Txt_Title->P_RTxt_Guide = 0x80).
-	// Vanilla UE 5.3 : 0x78.
-	static constexpr int FPropertySize = 0x80;
+	// Aion 2 EU/TW : UE 5.3 vanilla, FProperty = 0x78 bytes.
+	//
+	// Historique (corrige 03/10/2026 apres remontee AIONSERVER) :
+	// L'ancienne valeur 0x80 etait tiree de diffs d'adresses mesures entre
+	// deux ObjectProperty adjacents dans RigVMFunction / InputSettings /
+	// AionWidget. Mais : sizeof(FObjectProperty) = sizeof(FProperty) + sizeof(UClass*) =
+	// 0x78 + 0x8 = 0x80. Donc on mesurait des ObjectProperty, pas des
+	// FProperty.
+	//
+	// Impact du bug : FByteProperty::GetEnum, FEnumProperty::GetEnum,
+	// FArrayProperty::GetInner, FStructProperty::GetStruct, FMapProperty::
+	// GetKey/GetValue lisaient tous a FPropertySize=0x80 (= +8 trop loin),
+	// soit sur du padding soit sur le debut du membre suivant.
+	// Resultat : pointeurs garbage, IsPtrReadable KO, EPropertyType::Unknown
+	// ecrit dans l'usmap de sortie.
+	// Confirme par AIONSERVER : 100% des EnumProperty sans nom, 100% des
+	// ArrayProperty avec inner=Unknown255 sur un dump UMD recent.
+	//
+	// Reference TW (TW-reference-usmap-ex-schema.usmap) et kelekelio
+	// 1.0.50.0 ont 0 nom manquant / 0 inner inconnu - produits avec Dumper-7
+	// qui detecte dynamiquement FPropertySize (pas de hardcoding).
+	static constexpr int FPropertySize = 0x78;
 	static constexpr bool HasOptimizedFName = false;
 
 	struct Offsets
