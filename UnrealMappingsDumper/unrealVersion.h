@@ -347,28 +347,36 @@ public:
 
 struct UnrealVersionBase : IUnrealVersion
 {
-	// Aion 2 EU/TW : UE 5.3 vanilla, FProperty = 0x78 bytes.
+	// Aion 2 EU/TW : FPropertySize provisoire a 0x80.
 	//
-	// Historique (corrige 03/10/2026 apres remontee AIONSERVER) :
-	// L'ancienne valeur 0x80 etait tiree de diffs d'adresses mesures entre
-	// deux ObjectProperty adjacents dans RigVMFunction / InputSettings /
-	// AionWidget. Mais : sizeof(FObjectProperty) = sizeof(FProperty) + sizeof(UClass*) =
-	// 0x78 + 0x8 = 0x80. Donc on mesurait des ObjectProperty, pas des
-	// FProperty.
+	// HISTORIQUE (03/10/2026, 3 iterations) :
 	//
-	// Impact du bug : FByteProperty::GetEnum, FEnumProperty::GetEnum,
-	// FArrayProperty::GetInner, FStructProperty::GetStruct, FMapProperty::
-	// GetKey/GetValue lisaient tous a FPropertySize=0x80 (= +8 trop loin),
-	// soit sur du padding soit sur le debut du membre suivant.
-	// Resultat : pointeurs garbage, IsPtrReadable KO, EPropertyType::Unknown
-	// ecrit dans l'usmap de sortie.
-	// Confirme par AIONSERVER : 100% des EnumProperty sans nom, 100% des
-	// ArrayProperty avec inner=Unknown255 sur un dump UMD recent.
+	// 1. v0 : 0x80 tire de diffs d'adresses entre deux ObjectProperty adjacents
+	//    dans RigVMFunction / InputSettings / AionWidget.
+	//    -> 18 868 EnumProperty dumpees, 85 nommees, 17 728 Array dont 152
+	//       avec inner correct. Taux de reussite ~0.5%, inacceptable.
 	//
-	// Reference TW (TW-reference-usmap-ex-schema.usmap) et kelekelio
-	// 1.0.50.0 ont 0 nom manquant / 0 inner inconnu - produits avec Dumper-7
-	// qui detecte dynamiquement FPropertySize (pas de hardcoding).
-	static constexpr int FPropertySize = 0x78;
+	// 2. v1 (teste 03/10 commit 886a3be) : baisse a 0x78 (UE 5.3 vanilla selon
+	//    sizeof(FProperty) theorique).
+	//    -> 14 929 EnumProperty, 0 nommee, 17 574 Array, 0 inner correct.
+	//       Pire que v0.
+	//
+	// 3. revert a 0x80 : la valeur 0x78 est trop petite. 0x80 lisait au moins
+	//    des pointeurs plausibles 85 fois. La vraie valeur est probablement
+	//    0x88 ou plus (NCsoft a ajoute un membre custom dans FField ou
+	//    FProperty, probablement un pointeur anti-tamper ou un hash).
+	//
+	// SOLUTION ROBUSTE (TODO v31) : porter la detection dynamique de
+	// Dumper-7 (OffsetFinder.cpp FindEnumPropertyBaseOffset). Dumper-7 trouve
+	// la vraie taille FProperty en cherchant un pointeur UEnum attendu dans
+	// ActorComponent::CreationMethod + Pawn::AutoPossessAI. Code compact
+	// (~80 lignes). Sans ca, chaque patch client Aion 2 risque de casser
+	// cette constante.
+	//
+	// Reference TW (TW-reference-usmap-ex-schema.usmap) et kelekelio ont
+	// 0 nom manquant / 0 inner inconnu - produits par Dumper-7 qui fait
+	// cette detection dynamique.
+	static constexpr int FPropertySize = 0x80;
 	static constexpr bool HasOptimizedFName = false;
 
 	struct Offsets

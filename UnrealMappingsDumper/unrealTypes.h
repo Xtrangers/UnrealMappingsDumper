@@ -490,20 +490,20 @@ class FArrayProperty : public FProperty
 		UsesMemoryImageAllocator
 	};
 
-	// UE 5.3 : l'ordre a ete inverse par rapport a 5.2 et avant.
-	// Avant 5.3 : { FProperty* Inner; EArrayPropertyFlags ArrayFlags; }
-	// En 5.3    : { EArrayPropertyFlags ArrayFlags; FProperty* Inner; }
-	// Donc Inner est a FPropertySize + 8 (apres ArrayFlags + padding 4 octets).
-	// Source : UEDumper #if UE_VERSION < UE_5_03.
-	EArrayPropertyFlags ArrayFlags;
+	// Ordre d'origine UMD. En UE 5.3 Fortnite / Epic standard l'ordre a ete
+	// inverse ({ ArrayFlags; Inner; }) et Inner serait a FPropertySize + 8.
+	// Mais la detection dynamique de Dumper-7 (FindInnerTypeOffset) montre
+	// que meme en 5.3+ certains jeux (NCsoft, custom builds) ont conserve
+	// l'ordre historique. On garde donc l'ordre original ici ; la vraie
+	// detection d'offset se fera via FindInnerType au runtime (TODO).
 	FProperty* Inner;
+	EArrayPropertyFlags ArrayFlags;
 
 public:
 
 	FORCEINLINE FProperty* GetInner()
 	{
-		// Inner apres ArrayFlags (int32) + padding : offset total = FPropertySize + 8.
-		return QUICK_OFFSET(FProperty*, FPropertySize + 0x8);
+		return QUICK_OFFSET(FProperty*, FPropertySize);
 	}
 };
 
