@@ -174,6 +174,93 @@ static bool TryDetectFPropertySize(int32_t* outSize) noexcept
 }
 
 
+/*
+ * Detecte si FArrayProperty utilise l'ancien ordre {Inner; ArrayFlags;}
+ * (UE <= 5.2) ou le nouveau ordre {ArrayFlags; Inner;} (UE 5.3+).
+ *
+ * Technique : parcourt plusieurs classes connues qui contiennent des
+ * ArrayProperty, et pour chaque Property teste les 2 offsets Inner candidats
+ * (FPropertySize+0 et FPropertySize+8). Chaque candidat est "vote" si :
+ *   - l'adresse a l'offset est lisible
+ *   - elle contient un pointeur lisible
+ *   - ce pointeur ressemble a une FProperty (sa ClassPrivate est lisible)
+ *
+ * Celui qui recoit significativement plus de votes gagne. Si egalite ou
+ * marge faible, on reste sur l'ancien ordre (plus sur).
+ *
+ * Appele apres TryDetectFPropertySize pour avoir la bonne valeur de reference.
+ */
+static void TryDetectArrayInnerOffset() noexcept
+{
+	FArrayProperty::ArrayInnerExtraOffset = 0;  // default : ancien ordre
+
+	const wchar_t* classesToTest[] = {
+		L"GameViewportClient", L"ActorComponent", L"Pawn", L"PlayerController",
+		L"World", L"GameInstance", L"Actor"
+	};
+
+	int32_t votesAt0 = 0;
+	int32_t votesAt8 = 0;
+
+	for (const wchar_t* cName : classesToTest) {
+		UClass* cls = nullptr;
+		__try {
+			cls = ObjObjects::FindObjectByName<UClass>(cName);
+		} __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+		if (!IsPtrOk(cls)) continue;
+
+		uint8_t* p = nullptr;
+		__try {
+			p = (uint8_t*)cls->ChildProperties();
+		} __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+		int visited = 0;
+		while (IsPtrOk(p) && visited++ < 128) {
+			__try {
+				uint8_t* at0 = p + FProperty::FPropertySize;
+				uint8_t* at8 = p + FProperty::FPropertySize + 0x8;
+				if (IsPtrOk(at0)) {
+					void* v0 = *(void**)at0;
+					if (IsPtrOk(v0)) {
+						// Verifie ClassPrivate (offset 0x8 dans FField)
+						void* vclass0 = *(void**)((uint8_t*)v0 + 0x8);
+						if (IsPtrOk(vclass0)) votesAt0++;
+					}
+				}
+				if (IsPtrOk(at8)) {
+					void* v8 = *(void**)at8;
+					if (IsPtrOk(v8)) {
+						void* vclass8 = *(void**)((uint8_t*)v8 + 0x8);
+						if (IsPtrOk(vclass8)) votesAt8++;
+					}
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			// Avance via Next 0x48
+			uint8_t* nx = p + 0x48;
+			if (!IsPtrOk(nx)) break;
+			uint8_t* nextP = nullptr;
+			__try {
+				nextP = *(uint8_t**)nx;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+			if (!nextP || nextP == p) break;
+			p = nextP;
+		}
+	}
+
+	wchar_t vbuf[256] = {};
+	wsprintfW(vbuf, L"[FPropDetect] Array votes : at FPropertySize+0 = %d, at FPropertySize+8 = %d",
+		votesAt0, votesAt8);
+	LogFPropDetect(vbuf);
+	if (votesAt8 > votesAt0 * 2) {
+		FArrayProperty::ArrayInnerExtraOffset = 0x8;
+		LogFPropDetect(L"[FPropDetect] -> reorder UE 5.3+ retenu : Inner a FPropertySize+8");
+	} else {
+		LogFPropDetect(L"[FPropDetect] -> ancien ordre retenu : Inner a FPropertySize");
+	}
+}
+
+
 //this is super unsafe but hopefully stackoverflow comes in clutch https://stackoverflow.com/a/42389638
 bool IUnrealVersion::TryDynamicOffsets()
 {
@@ -204,18 +291,22 @@ bool IUnrealVersion::TryDynamicOffsets()
 		if (!UObject::OuterOffset)
 			return false;
 
-		// Nouvelle etape (03/10/2026) : detection dynamique de FPropertySize
-		// via EComponentCreationMethod dans UActorComponent. Si echec, on
-		// garde la valeur hardcodee de la Version<> active (0x80 pour Aion 2).
-		int32_t detectedSize = 0;
-		if (TryDetectFPropertySize(&detectedSize)) {
-			FProperty::FPropertySize = detectedSize;
-		}
 	}
 	catch (...)
 	{
 		return false;
 	}
+
+	// Nouvelle etape (03/10/2026) : detection dynamique de FPropertySize
+	// via EComponentCreationMethod dans UActorComponent. Si echec, on
+	// garde la valeur hardcodee de la Version<> active (0x80 pour Aion 2).
+	int32_t detectedSize = 0;
+	if (TryDetectFPropertySize(&detectedSize)) {
+		FProperty::FPropertySize = detectedSize;
+	}
+
+	// Nouvelle etape 2 : detection du reorder FArrayProperty UE 5.3+.
+	TryDetectArrayInnerOffset();
 
 	return true;
 }

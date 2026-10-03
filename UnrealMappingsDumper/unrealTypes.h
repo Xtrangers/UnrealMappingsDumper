@@ -422,11 +422,11 @@ private:
 	uint32_t ArrayDim;      // +0x30
 	uint32_t ElementSize;   // +0x34
 
-protected:
-
-	static inline int FPropertySize = 0;
-
 public:
+
+	// Public pour permettre la detection dynamique en dehors de IUnrealVersion
+	// (voir unrealVersion.cpp TryDetectArrayInnerOffset et autres helpers).
+	static inline int FPropertySize = 0;
 
 	friend struct IUnrealVersion;
 
@@ -490,20 +490,23 @@ class FArrayProperty : public FProperty
 		UsesMemoryImageAllocator
 	};
 
-	// Ordre d'origine UMD. En UE 5.3 Fortnite / Epic standard l'ordre a ete
-	// inverse ({ ArrayFlags; Inner; }) et Inner serait a FPropertySize + 8.
-	// Mais la detection dynamique de Dumper-7 (FindInnerTypeOffset) montre
-	// que meme en 5.3+ certains jeux (NCsoft, custom builds) ont conserve
-	// l'ordre historique. On garde donc l'ordre original ici ; la vraie
-	// detection d'offset se fera via FindInnerType au runtime (TODO).
-	FProperty* Inner;
-	EArrayPropertyFlags ArrayFlags;
+	// Ordre reel dans Aion 2 (detecte dynamiquement) :
+	// Avant 5.3 : { FProperty* Inner; EArrayPropertyFlags ArrayFlags; }
+	//   -> Inner a FPropertySize
+	// En 5.3+   : { EArrayPropertyFlags ArrayFlags; FProperty* Inner; }
+	//   -> Inner a FPropertySize + 8 (ArrayFlags int32 + padding 4)
+	// L'ArrayInnerExtraOffset est calcule au runtime par
+	// TryDynamicOffsets() via UGameViewportClient::DebugProperties
+	// (meme technique que Dumper-7 FindInnerTypeOffset).
 
 public:
 
+	// = 0 pour UE <= 5.2, = 8 pour UE 5.3+. Detecte au runtime.
+	static inline int ArrayInnerExtraOffset = 0;
+
 	FORCEINLINE FProperty* GetInner()
 	{
-		return QUICK_OFFSET(FProperty*, FPropertySize);
+		return QUICK_OFFSET(FProperty*, FPropertySize + ArrayInnerExtraOffset);
 	}
 };
 
