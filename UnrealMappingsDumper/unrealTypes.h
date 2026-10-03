@@ -522,6 +522,20 @@ public:
 	}
 };
 
+// FOptionalProperty = { FProperty* ValueProperty; }
+// Nouvelle en UE 5.3 (TOptional). Pas de reorder possible, un seul membre
+// apres FProperty, donc ValueProperty est a FPropertySize.
+// Ref : Dumper-7 Off::OptionalProperty::ValueProperty = PropertySize
+// (Offsets.cpp:554).
+class FOptionalProperty : public FProperty
+{
+public:
+	FORCEINLINE FProperty* GetValueProperty()
+	{
+		return QUICK_OFFSET(FProperty*, FPropertySize);
+	}
+};
+
 class FMapProperty : public FProperty
 {
 	FProperty* KeyProp;

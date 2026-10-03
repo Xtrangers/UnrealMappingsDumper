@@ -38,7 +38,11 @@ enum class EPropertyType : uint8_t
 	SetProperty,
 	EnumProperty,
 	FieldPathProperty,
-	EnumAsByteProperty,
+	OptionalProperty,  // UE 5.3+ TOptional<T>, ajoute 04/10/2026 pour AIONSERVER.
+	                   // DOIT valoir 28 : correspond a PT_OPTIONAL = 28 dans
+	                   // USMAP Explorer / CUE4Parse ExplicitEnumValues v3.
+	EnumAsByteProperty,  // Marqueur interne UMD uniquement (reecrit en
+	                     // EnumProperty au moment de l'ecriture, dumper.cpp:715).
 
 	Unknown = 0xFF
 };
@@ -226,6 +230,7 @@ enum EClassCastFlags : __int64
 	CASTCLASS_FObjectPtrProperty = 0x0020000000000000,
 	CASTCLASS_FClassPtrProperty = 0x0040000000000000,
 	CASTCLASS_FLargeWorldCoordinatesRealProperty = 0x0080000000000000,
+	CASTCLASS_FOptionalProperty = 0x0100000000000000,  // UE 5.3+ TOptional<T>
 };
 
 enum EClassFlags

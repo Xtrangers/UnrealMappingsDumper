@@ -444,6 +444,10 @@ static EPropertyType GetPropertyType(FProperty* Prop)
 	{
 		return EPropertyType::FieldPathProperty;
 	}
+	case CASTCLASS_FOptionalProperty:
+	{
+		return EPropertyType::OptionalProperty;
+	}
 	default:
 	{
 		return EPropertyType::Unknown;
@@ -840,6 +844,32 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 			WritePropertyWrapper(Inner, InnerType, Buffer);
 			auto ValueType = GetPropertyType(Value);
 			WritePropertyWrapper(Value, ValueType, Buffer);
+			break;
+		}
+		case EPropertyType::OptionalProperty:
+		{
+			// FOptionalProperty = { FProperty* ValueProperty; }
+			// Nouvelle en UE 5.3, equivalente a TOptional<T>. On ecrit le
+			// type de son ValueProperty comme sous-type (meme pattern que
+			// ArrayProperty mais sans ArrayFlags).
+			// Ajoute 04/10/2026 pour debloquer les 3 cas restants chez
+			// AIONSERVER (apres validation COURANT v10).
+			bool innerOk = false;
+			FProperty* Inner = nullptr;
+			__try {
+				Inner = static_cast<FOptionalProperty*>(Prop)->GetValueProperty();
+				if (IsPtrReadable(Inner)) {
+					auto cls = Inner->GetClass();
+					if (IsPtrReadable(cls)) innerOk = true;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+			if (!innerOk) {
+				Buffer.Write(EPropertyType::Unknown);
+				break;
+			}
+			auto InnerType = GetPropertyType(Inner);
+			WritePropertyWrapper(Inner, InnerType, Buffer);
 			break;
 		}
 		}
