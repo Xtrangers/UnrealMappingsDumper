@@ -5,6 +5,19 @@
 #include "oodle.h"
 #include "aion2Offsets.h"
 
+// v30 : Shell COM pour lire PKEY_Software_ProductVersion de AION2.exe
+#include <shlobj.h>
+#include <propsys.h>
+#include <propvarutil.h>
+#pragma comment(lib, "propsys.lib")
+
+// Definition locale de PKEY_Software_ProductVersion (fmtid + pid=8)
+// cf. propkey.h : DEFINE_PROPERTYKEY(PKEY_Software_ProductVersion,
+//     0x0CEF7D0C, 0x1826, 0x4D1F, 0xA4, 0xC1, 0xBD, 0x4B, 0xC6, 0x7D, 0x9F, 0x12, 8);
+static const PROPERTYKEY kPkeyProductVersion = {
+    { 0x0CEF7D0C, 0x1826, 0x4D1F, { 0xA4, 0xC1, 0xBD, 0x4B, 0xC6, 0x7D, 0x9F, 0x12 } }, 8
+};
+
 // v0.0.17.12 : validation runtime pointeur via VirtualQuery — evite les crashes
 // silencieux sur UStruct partiels (heap corruption bypass SEH).
 // v0.0.17.17 : revert alignment check de 17.16 qui a regresse le ForEach.
@@ -1261,49 +1274,60 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 
 	std::string versionKey = "UNKNOWN-_version-inconnue";
 
-	// --- Piste TW : chemin contient "AION2_TW" ---
-	if (wcsstr(exePath, L"AION2_TW") != nullptr) {
-		char buf[2048] = {};
-		DWORD n = ReadFileAll(
-			L"C:\\IA\\Aion\\Aion 2\\Client\\AION2_TW\\VersionInfo_A2_TW_L_GA_PURPLE.xml",
-			buf, sizeof(buf));
-		versionKey = "TW-_version-inconnue";
-		if (n > 0) {
-			const char* op = strstr(buf, "<Version>");
-			if (op) {
-				op += 9;
-				const char* cl = strstr(op, "</Version>");
-				if (cl && cl > op && (cl - op) <= 16) {
-					std::string ver(op, cl - op);
-					TrimVerAscii(ver);
-					if (!ver.empty()) versionKey = "TW-" + ver;
-				}
-			}
+	// v30 (03/10/2026) : UMD autonome. Il lit lui-meme la "Version du produit"
+	// du exe cible via Shell COM (PKEY_Software_ProductVersion = index 307).
+	// Format : "1.0.21.0.2026031801" -> on split au dernier point :
+	//   jeu   = "1.0.21.0"
+	//   build = "2026031801"
+	// => versionKey = "<REGION>-<jeu>-<build>" ex "EU-1.0.21.0-2026031801"
+	{
+		// Determine la region a partir du chemin
+		std::string region;
+		if (wcsstr(exePath, L"AION2_TW") != nullptr) {
+			region = "TW";
+		} else if (wcsstr(exePath, L"steamapps") != nullptr) {
+			region = "EU";
+		} else {
+			region = "UNKNOWN";
 		}
-	}
-	// --- Piste EU : chemin contient "steamapps\common\AION2" ---
-	else if (wcsstr(exePath, L"steamapps") != nullptr) {
-		char buf[4096] = {};
-		DWORD n = ReadFileAll(
-			L"C:\\Program Files (x86)\\Steam\\steamapps\\appmanifest_3393110.acf",
-			buf, sizeof(buf));
-		versionKey = "EU-_version-inconnue";
-		if (n > 0) {
-			// Format ACF Steam : "buildid"\t\t"25624879"\n
-			// Apres la cle "buildid" (fermee par "), on cherche le PROCHAIN " qui
-			// ouvre la valeur, puis le " qui la ferme.
-			const char* op = strstr(buf, "\"buildid\"");
-			if (op) {
-				op += 9;                        // saute "buildid" (9 chars)
-				op = strchr(op, '"');           // ouverture de la valeur
-				if (op) {
-					op++;                       // debut de la valeur
-					const char* cl = strchr(op, '"'); // fermeture
-					if (cl && cl > op && (cl - op) <= 16) {
-						std::string ver(op, cl - op);
-						TrimVerAscii(ver);
-						if (!ver.empty()) versionKey = "EU-" + ver;
-					}
+
+		// Lit la Version du produit via Shell COM
+		std::string productVersion;
+		HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+		const bool coInit = SUCCEEDED(hr);
+		IPropertyStore* pStore = nullptr;
+		hr = SHGetPropertyStoreFromParsingName(exePath, nullptr, GPS_DEFAULT,
+			IID_PPV_ARGS(&pStore));
+		if (SUCCEEDED(hr) && pStore) {
+			PROPVARIANT pv;
+			PropVariantInit(&pv);
+			if (SUCCEEDED(pStore->GetValue(kPkeyProductVersion, &pv))) {
+				if (pv.vt == VT_LPWSTR && pv.pwszVal) {
+					char buf[128] = {};
+					WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, buf, 128, nullptr, nullptr);
+					productVersion = buf;
+					TrimVerAscii(productVersion);
+				}
+				PropVariantClear(&pv);
+			}
+			pStore->Release();
+		}
+		if (coInit) CoUninitialize();
+
+		// Construit la cle
+		if (productVersion.empty()) {
+			versionKey = region + "-_version-inconnue";
+		} else {
+			size_t lastDot = productVersion.find_last_of('.');
+			if (lastDot == std::string::npos) {
+				versionKey = region + "-" + productVersion;
+			} else {
+				std::string versionJeu = productVersion.substr(0, lastDot);
+				std::string buildId    = productVersion.substr(lastDot + 1);
+				if (buildId.empty()) {
+					versionKey = region + "-" + versionJeu;
+				} else {
+					versionKey = region + "-" + versionJeu + "-" + buildId;
 				}
 			}
 		}
@@ -1354,8 +1378,11 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 		}
 	}
 
-	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT-EXTRAIT\\SCHEMAS\\versions\\"
-	                       + versionKey + "\\dumps\\umd";
+	// v30 : refonte arborescence CLIENT\<region>\<versionKey>\Usmap
+	// region = 2 premiers chars de versionKey ("EU", "TW" ou "UN"...)
+	std::string region = versionKey.substr(0, 2);
+	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT\\"
+	                       + region + "\\" + versionKey + "\\Usmap";
 
 	// std::filesystem cree l'arbo entiere (deja inclus dans framework.h, pas de nouvelle dependance).
 	// create_directories retourne true si nouveau dossier cree, false si deja existant ou echec.
