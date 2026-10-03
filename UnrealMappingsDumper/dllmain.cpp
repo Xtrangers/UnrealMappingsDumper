@@ -148,7 +148,7 @@ static VOID CALLBACK UMD_ScanCallback(PVOID Context, BOOLEAN)
 				pct);
 		}
 
-		UE_LOG("=== FIN UnrealMappingsDumper (usmap ecrit dans C:\\Users\\Public\\Mappings-Aion2.usmap) ===");
+		UE_LOG("=== FIN UnrealMappingsDumper (usmap ecrit dans CLIENT\\<region>\\<versionKey>\\Usmap\\Mappings-Aion2-*.usmap) ===");
 	}
 	catch (const std::exception& e)
 	{

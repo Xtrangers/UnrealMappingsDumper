@@ -1236,13 +1236,13 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	Checkpoint(L"P4 done : UsmapData.size=%zu", UsmapData.size());
 
 	// v0.0.19.8 (30/09/2026) : ecrit UNIQUEMENT dans l'emplacement version-scope.
-	// CLIENT-EXTRAIT\SCHEMAS\versions\<REGION-Version>\dumps\umd\Mappings-Aion2-<ts>.usmap
+	// v30 (03/10/2026) : refonte -> CLIENT\<region>\<versionKey>\Usmap\Mappings-Aion2-<ts>.usmap
 	// L'ancien fallback C:\Users\Public\Mappings-Aion2.usmap est supprime pour
 	// eviter la confusion (deux fichiers = deux verites, l'un ecrasant l'autre a
 	// chaque dump). La suite (P5b) fait l'ecriture reelle.
 	Checkpoint(L"P5 done : UsmapData prete pour P5b (taille=%zu)", UsmapData.size());
 
-	// --- P5b : copie horodatee dans SCHEMAS\versions\<REGION-Version>\dumps\umd\ ---
+	// --- P5b : copie horodatee dans CLIENT\<region>\<versionKey>\Usmap\ ---
 	//
 	// Auto-detection region + version selon le processus courant :
 	//   1. Si l'exe se trouve sous "AION2_TW\..." -> region TW, version lue dans
@@ -1381,38 +1381,38 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	// v30 : refonte arborescence CLIENT\<region>\<versionKey>\Usmap
 	// region = 2 premiers chars de versionKey ("EU", "TW" ou "UN"...)
 	std::string region = versionKey.substr(0, 2);
-	std::string schemaBase = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT\\"
-	                       + region + "\\" + versionKey + "\\Usmap";
+	std::string clientUsmapDir = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT\\"
+	                           + region + "\\" + versionKey + "\\Usmap";
 
 	// std::filesystem cree l'arbo entiere (deja inclus dans framework.h, pas de nouvelle dependance).
 	// create_directories retourne true si nouveau dossier cree, false si deja existant ou echec.
 	// Le vrai indicateur d'echec = fsEc non zero.
 	std::error_code fsEc;
-	std::filesystem::create_directories(schemaBase, fsEc);
+	std::filesystem::create_directories(clientUsmapDir, fsEc);
 	if (fsEc) {
 		wchar_t wErr[64] = {};
 		wsprintfW(wErr, L"%d", fsEc.value());
-		Checkpoint(L"P5b ERREUR : create_directories a echoue (err=%s) - dump NON copie en SCHEMAS", wErr);
+		Checkpoint(L"P5b ERREUR : create_directories a echoue (err=%s) - dump NON copie dans CLIENT\\<region>\\<versionKey>\\Usmap", wErr);
 		return;
 	}
 
 	// Verifie qu'apres l'appel, le dossier existe reellement (double check).
-	if (!std::filesystem::exists(schemaBase, fsEc)) {
+	if (!std::filesystem::exists(clientUsmapDir, fsEc)) {
 		Checkpoint(L"P5b ERREUR : dossier cible inexistant apres create_directories - dump NON copie");
 		return;
 	}
 
 	// Construit le nom final : Mappings-Aion2[-<tag>]-<timestamp>.usmap
-	std::string schemaFile = schemaBase + "\\Mappings-Aion2";
-	if (!tag.empty()) schemaFile += "-" + tag;
-	schemaFile += "-" + std::string(stamp) + ".usmap";
+	std::string outUsmapPath = clientUsmapDir + "\\Mappings-Aion2";
+	if (!tag.empty()) outUsmapPath += "-" + tag;
+	outUsmapPath += "-" + std::string(stamp) + ".usmap";
 
 	// Ouverture safe : verifie fopen_s AVANT d'utiliser FileWriter (qui fait fclose(nullptr)
 	// dans son dtor si l'ouverture a echoue).
 	FILE* fh = nullptr;
-	if (fopen_s(&fh, schemaFile.c_str(), "wb") != 0 || fh == nullptr) {
+	if (fopen_s(&fh, outUsmapPath.c_str(), "wb") != 0 || fh == nullptr) {
 		wchar_t wPath[MAX_PATH * 2] = {};
-		MultiByteToWideChar(CP_UTF8, 0, schemaFile.c_str(), -1, wPath, MAX_PATH * 2);
+		MultiByteToWideChar(CP_UTF8, 0, outUsmapPath.c_str(), -1, wPath, MAX_PATH * 2);
 		Checkpoint(L"P5b ERREUR : fopen_s a echoue sur %s - dump NON copie", wPath);
 		return;
 	}
@@ -1431,11 +1431,11 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	fflush(fh);
 	fclose(fh);
 
-	wchar_t wSchemaFile[MAX_PATH * 2] = {};
-	MultiByteToWideChar(CP_UTF8, 0, schemaFile.c_str(), -1, wSchemaFile, MAX_PATH * 2);
+	wchar_t wOutPath[MAX_PATH * 2] = {};
+	MultiByteToWideChar(CP_UTF8, 0, outUsmapPath.c_str(), -1, wOutPath, MAX_PATH * 2);
 	if (wrote == UsmapData.size()) {
-		Checkpoint(L"P5b done : usmap AUSSI ECRIT dans %s (taille=%zu)", wSchemaFile, wrote);
+		Checkpoint(L"P5b done : usmap ecrit dans %s (taille=%zu)", wOutPath, wrote);
 	} else {
-		Checkpoint(L"P5b PARTIEL : ecrit %zu/%zu octets dans %s", wrote, UsmapData.size(), wSchemaFile);
+		Checkpoint(L"P5b PARTIEL : ecrit %zu/%zu octets dans %s", wrote, UsmapData.size(), wOutPath);
 	}
 }
