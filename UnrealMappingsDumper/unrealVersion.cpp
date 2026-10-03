@@ -252,7 +252,12 @@ static void TryDetectArrayInnerOffset() noexcept
 	wsprintfW(vbuf, L"[FPropDetect] Array votes : at FPropertySize+0 = %d, at FPropertySize+8 = %d",
 		votesAt0, votesAt8);
 	LogFPropDetect(vbuf);
-	if (votesAt8 > votesAt0 * 2) {
+
+	// Decision : on choisit l'offset qui a strictement plus de votes.
+	// Si egalite, on retient l'ancien ordre (plus sur comme fallback).
+	// L'ancien seuil "x2" avait rate le reorder UE 5.3+ sur Aion 2 EU
+	// (votesAt8=31 vs votesAt0=16, ratio 1.94, en-dessous du seuil 2.0).
+	if (votesAt8 > votesAt0) {
 		FArrayProperty::ArrayInnerExtraOffset = 0x8;
 		LogFPropDetect(L"[FPropDetect] -> reorder UE 5.3+ retenu : Inner a FPropertySize+8");
 	} else {
