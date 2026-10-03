@@ -11,11 +11,12 @@
 #include <propvarutil.h>
 #pragma comment(lib, "propsys.lib")
 
-// Definition locale de PKEY_Software_ProductVersion (fmtid + pid=8)
-// cf. propkey.h : DEFINE_PROPERTYKEY(PKEY_Software_ProductVersion,
-//     0x0CEF7D0C, 0x1826, 0x4D1F, 0xA4, 0xC1, 0xBD, 0x4B, 0xC6, 0x7D, 0x9F, 0x12, 8);
+// Definition locale de PKEY_Software_ProductVersion (fmtid + pid=8).
+// GUID correct = {0CEF7D53-FA64-11D1-A203-0000F81FEDEE} (System.Software.ProductVersion).
+// Correctif 03/10/2026 : ancien GUID 0CEF7D0C-...-9F12 retournait VIDE sur AION2.exe
+// (signale par AIONSERVER, confirme par test local). Correspond a Shell col 307.
 static const PROPERTYKEY kPkeyProductVersion = {
-    { 0x0CEF7D0C, 0x1826, 0x4D1F, { 0xA4, 0xC1, 0xBD, 0x4B, 0xC6, 0x7D, 0x9F, 0x12 } }, 8
+    { 0x0CEF7D53, 0xFA64, 0x11D1, { 0xA2, 0x03, 0x00, 0x00, 0xF8, 0x1F, 0xED, 0xEE } }, 8
 };
 
 // v0.0.17.12 : validation runtime pointeur via VirtualQuery — evite les crashes
