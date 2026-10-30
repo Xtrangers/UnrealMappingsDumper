@@ -8,6 +8,26 @@ Journal anti-chronologique.
 
 ---
 
+## 2026-10-30 — Chemin de sortie CLIENT -> Game/Aion 2/Client
+
+Remi a deplace son dossier Aion 2 de `C:\IA\Aion\Aion 2\Projet\CLIENT\`
+vers `C:\IA\Game\Aion 2\Client\` (suppression du niveau `Projet/`,
+nouvelle hierarchie `Client/Server/Studio/Divers/`).
+
+Patch une ligne dans `UnrealMappingsDumper\dumper.cpp:1437` : le
+`clientUsmapDir` pointe desormais sur le nouveau chemin. Les offsets
+Aion 2 (`C:\Users\Public\offsets-aion2.json`) restent inchanges, logs
+UMD aussi dans `C:\Users\Public\` (poubelles de debug stables).
+
+DLL recompilee (MSBuild Release x64, 348160 bytes) et copiee dans
+`Game-Tools/Dll/bin/UnrealMappingsDumper.dll`. Patch depuis la session
+InjectorXXX de Remi (chef auto, journal du 2026-10-30, accord du chef
+fil 604 de la messagerie). Verifie : dump UMD a 07:52 ecrivait encore
+dans l'ancien chemin ; apres le patch, prochain dump ecrira dans le
+nouveau.
+
+---
+
 ## 2026-10-04 — Migration dans Game-Tools/Dll/projet/
 
 Déplacement du dossier `C:\IA\Claude\Game-Tools\UnrealMappingsDumper\`

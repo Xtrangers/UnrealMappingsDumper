@@ -1434,7 +1434,7 @@ void Dumper::Run(ECompressionMethod CompressionMethod)
 	// v30 : refonte arborescence CLIENT\<region>\<versionKey>\Usmap
 	// region = 2 premiers chars de versionKey ("EU", "TW" ou "UN"...)
 	std::string region = versionKey.substr(0, 2);
-	std::string clientUsmapDir = "C:\\IA\\Aion\\Aion 2\\Projet\\CLIENT\\"
+	std::string clientUsmapDir = "C:\\IA\\Game\\Aion 2\\Client\\"
 	                           + region + "\\" + versionKey + "\\Usmap";
 
 	// std::filesystem cree l'arbo entiere (deja inclus dans framework.h, pas de nouvelle dependance).
