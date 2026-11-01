@@ -190,6 +190,65 @@ static bool TryDetectFPropertySize(int32_t* outSize) noexcept
  *
  * Appele apres TryDetectFPropertySize pour avoir la bonne valeur de reference.
  */
+// Liste blanche des FFieldClass UE 5.3 : tout vrai Inner d'ArrayProperty
+// pointe vers une FProperty dont la ClassPrivate a un nom dans cette liste.
+// Un pointeur bidon peut passer les tests de lisibilite mais presque jamais
+// cette verification stricte.
+static const wchar_t* kFFieldClassWhitelist[] = {
+	L"ByteProperty", L"BoolProperty", L"IntProperty", L"FloatProperty",
+	L"ObjectProperty", L"NameProperty", L"DelegateProperty", L"DoubleProperty",
+	L"ArrayProperty", L"StructProperty", L"StrProperty", L"TextProperty",
+	L"InterfaceProperty", L"MulticastDelegateProperty",
+	L"MulticastInlineDelegateProperty", L"MulticastSparseDelegateProperty",
+	L"WeakObjectProperty", L"LazyObjectProperty", L"AssetObjectProperty",
+	L"SoftObjectProperty", L"UInt64Property", L"UInt32Property",
+	L"UInt16Property", L"Int64Property", L"Int16Property", L"Int8Property",
+	L"MapProperty", L"SetProperty", L"EnumProperty", L"FieldPathProperty",
+	L"OptionalProperty", L"ClassProperty", L"SoftClassProperty",
+	nullptr
+};
+
+static bool IsWhitelistedFFieldClassName(const std::wstring_view& name) noexcept {
+	for (int i = 0; kFFieldClassWhitelist[i]; ++i) {
+		const wchar_t* w = kFFieldClassWhitelist[i];
+		size_t wlen = 0; while (w[wlen]) wlen++;
+		if (name.size() == wlen) {
+			bool eq = true;
+			for (size_t j = 0; j < wlen; ++j) {
+				if (name[j] != w[j]) { eq = false; break; }
+			}
+			if (eq) return true;
+		}
+	}
+	return false;
+}
+
+// Verifie qu'un FField* candidat suit la chaine ClassPrivate->Name et que
+// ce nom est bien un FFieldClass UE connu. Retourne true si strictement
+// valide (= tres probable que ce soit un vrai FProperty).
+static bool IsValidFPropertyCandidate(void* candidate) noexcept {
+	if (!IsPtrOk(candidate)) return false;
+	void* classPrivate = nullptr;
+	__try {
+		// FField::ClassPrivate @ +0x08
+		classPrivate = *(void**)((uint8_t*)candidate + 0x8);
+	} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	if (!IsPtrOk(classPrivate)) return false;
+	// FFieldClass::Name (FName) @ +0x00.
+	// On resout via le mecanisme UE deja setup (FName::AsString via NamePool).
+	FName* fname = nullptr;
+	__try {
+		fname = (FName*)classPrivate;
+	} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	if (!fname) return false;
+	std::wstring_view nameView;
+	__try {
+		nameView = fname->AsString();
+	} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	if (nameView.empty()) return false;
+	return IsWhitelistedFFieldClassName(nameView);
+}
+
 static void TryDetectArrayInnerOffset() noexcept
 {
 	FArrayProperty::ArrayInnerExtraOffset = 0;  // default : ancien ordre
@@ -199,8 +258,9 @@ static void TryDetectArrayInnerOffset() noexcept
 		L"World", L"GameInstance", L"Actor"
 	};
 
-	int32_t votesAt0 = 0;
-	int32_t votesAt8 = 0;
+	int32_t validAt0 = 0;
+	int32_t validAt8 = 0;
+	int32_t totalArrays = 0;
 
 	for (const wchar_t* cName : classesToTest) {
 		UClass* cls = nullptr;
@@ -216,23 +276,22 @@ static void TryDetectArrayInnerOffset() noexcept
 
 		int visited = 0;
 		while (IsPtrOk(p) && visited++ < 128) {
+			// On ne restreint pas aux ArrayProperty via leur ClassPrivate (ca
+			// couterait un lookup supplementaire) : on teste les 2 offsets
+			// candidats sur TOUTES les Property. Un slot qui ne contient pas
+			// un vrai FProperty* echouera a la verification stricte.
 			__try {
 				uint8_t* at0 = p + FProperty::FPropertySize;
 				uint8_t* at8 = p + FProperty::FPropertySize + 0x8;
-				if (IsPtrOk(at0)) {
-					void* v0 = *(void**)at0;
-					if (IsPtrOk(v0)) {
-						// Verifie ClassPrivate (offset 0x8 dans FField)
-						void* vclass0 = *(void**)((uint8_t*)v0 + 0x8);
-						if (IsPtrOk(vclass0)) votesAt0++;
-					}
-				}
-				if (IsPtrOk(at8)) {
-					void* v8 = *(void**)at8;
-					if (IsPtrOk(v8)) {
-						void* vclass8 = *(void**)((uint8_t*)v8 + 0x8);
-						if (IsPtrOk(vclass8)) votesAt8++;
-					}
+				void* v0 = nullptr, * v8 = nullptr;
+				if (IsPtrOk(at0)) v0 = *(void**)at0;
+				if (IsPtrOk(at8)) v8 = *(void**)at8;
+				bool ok0 = IsValidFPropertyCandidate(v0);
+				bool ok8 = IsValidFPropertyCandidate(v8);
+				if (ok0 || ok8) {
+					totalArrays++;
+					if (ok0) validAt0++;
+					if (ok8) validAt8++;
 				}
 			} __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -249,19 +308,23 @@ static void TryDetectArrayInnerOffset() noexcept
 	}
 
 	wchar_t vbuf[256] = {};
-	wsprintfW(vbuf, L"[FPropDetect] Array votes : at FPropertySize+0 = %d, at FPropertySize+8 = %d",
-		votesAt0, votesAt8);
+	wsprintfW(vbuf,
+		L"[FPropDetect] Array strict-check : valid at +0 = %d, valid at +8 = %d (total arrays = %d)",
+		validAt0, validAt8, totalArrays);
 	LogFPropDetect(vbuf);
 
-	// Decision : on choisit l'offset qui a strictement plus de votes.
-	// Si egalite, on retient l'ancien ordre (plus sur comme fallback).
-	// L'ancien seuil "x2" avait rate le reorder UE 5.3+ sur Aion 2 EU
-	// (votesAt8=31 vs votesAt0=16, ratio 1.94, en-dessous du seuil 2.0).
-	if (votesAt8 > votesAt0) {
+	// Decision deterministe : on prend l'offset qui matche la liste blanche
+	// FFieldClass. Un offset qui ne match RIEN est bruit RAM, meme si lisible.
+	if (validAt8 > validAt0) {
 		FArrayProperty::ArrayInnerExtraOffset = 0x8;
 		LogFPropDetect(L"[FPropDetect] -> reorder UE 5.3+ retenu : Inner a FPropertySize+8");
-	} else {
+	} else if (validAt0 > 0) {
+		FArrayProperty::ArrayInnerExtraOffset = 0;
 		LogFPropDetect(L"[FPropDetect] -> ancien ordre retenu : Inner a FPropertySize");
+	} else {
+		// Aucun candidat valide : fallback UE 5.3+ (le plus courant aujourd'hui).
+		FArrayProperty::ArrayInnerExtraOffset = 0x8;
+		LogFPropDetect(L"[FPropDetect] -> aucun match - fallback UE 5.3+ (+8)");
 	}
 }
 
